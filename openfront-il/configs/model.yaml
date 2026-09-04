@@ -1,0 +1,13 @@
+# Consumed by src/openfront_il/training/config.py, which passes these
+# through to models/checkpoint_format.py's SpatialEncoderConfig/
+# PolicyNetworkConfig. Only genuine architecture hyperparameters live
+# here — in_channels/flat_dim/action_type_count/unit_type_count are
+# derived from features/ constants at training time, not configured here,
+# since they're intrinsic to the feature encoding, not tunable.
+
+spatial_encoder:
+  latent_dim: 128
+  conv_channels: [16, 32, 64]
+
+policy_network:
+  hidden_dim: 128

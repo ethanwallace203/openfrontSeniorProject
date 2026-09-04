@@ -1,0 +1,33 @@
+# Data stages are regenerable and often large; never commit contents, only structure.
+data/raw/*
+data/snapshots/*
+data/processed/*
+!data/*/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+
+# Checkpoints / run artifacts
+checkpoints/
+runs/
+*.pt
+*.ckpt
+
+# Env
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

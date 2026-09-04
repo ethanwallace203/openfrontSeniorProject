@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    // This file is for type-checking (tsc --noEmit) and ESLint only — see
+    // tsconfig.run.json for the config actually used to RUN scripts with
+    // tsx, and its comment for why the two must differ.
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "paths": {
+      "resources/*": ["./engine/openfront-ai/openfront/resources/*"],
+      "src/*": ["./engine/openfront-ai/openfront/src/*"]
+    }
+  },
+  "include": ["engine/bridge/src", "engine/bridge/tests"],
+  "exclude": ["node_modules", "dist", "engine/openfront-ai"]
+}

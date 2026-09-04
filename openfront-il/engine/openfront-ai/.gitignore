@@ -1,0 +1,27 @@
+data/
+# Only SOPS-encrypted files under secrets/ are ever meant to be committed
+# (see .sops.yaml + scripts/load_secrets.sh) - block any plaintext secret
+# that might land here by accident (e.g. an unencrypted `sops -d -i` slip).
+secrets/*
+!secrets/*.enc.yaml
+!secrets/README.md
+!secrets/secrets.yaml
+.venv/
+__pycache__/
+*.pt
+runs/
+data-human/
+records/
+records-rl/
+/records
+*.webm
+!assets/*.webm
+replays/
+.DS_Store
+rust/ofrs/target/
+rust/target/
+rust/ofrs/Cargo.lock
+.venv-t/
+
+# Exported AE encoder weights (regenerate via scripts/export_safetensors.py)
+weights/ae/

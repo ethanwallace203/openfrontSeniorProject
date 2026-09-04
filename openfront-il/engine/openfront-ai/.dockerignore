@@ -1,0 +1,19 @@
+.git
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+.ruff_cache
+data/
+data-human/
+records-rl/
+replays/
+runs/
+hf-dataset/
+hf-human/
+*.webm
+*.gif
+.env
+.venv
+
+# Clone + patch openfront inside the image; keep submodule out of build context.
+openfront/

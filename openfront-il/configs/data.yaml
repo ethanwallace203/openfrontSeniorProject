@@ -1,0 +1,18 @@
+# Consumed by engine/bridge/src/gameIdSource.ts when no explicit gameIds or
+# --seed-file are given to fetchGame.ts. See configs/README.md.
+
+# ISO 8601. The /public/games endpoint caps a single request to a 2-day
+# window; gameIdSource.ts pages within that window via offset, but a range
+# wider than 2 days here will undercount unless the source is extended to
+# loop over multiple day-chunks. Keep this <= 2 days for now.
+startDate: "2026-08-29T00:00:00Z"
+endDate: "2026-08-30T00:00:00Z"
+
+# One of [Public, Private, Singleplayer]. Public multiplayer games are the
+# closest thing to "expert human play" available without a rank/ELO filter
+# (see docs/imitation_learning_plan.md for the full "what counts as expert
+# data" discussion).
+gameType: "Public"
+
+# Stop once this many gameIds have been collected.
+targetGameCount: 100

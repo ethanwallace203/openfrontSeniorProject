@@ -1,0 +1,305 @@
+//! Showcase util helpers ported from `rl/showcase_util.py`.
+
+use std::fs;
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use rand::seq::SliceRandom;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::paths::clips_dir;
+
+pub const LEGACY_POLICY_RUNS: &[&str] = &["ppo_v5", "ppo_v7"];
+
+pub fn showcase_maps() -> Vec<String> {
+    // Broad V10 pool minus Onion. Training may still sample Onion; human-facing
+    // showcase / hub clips must vary maps and must not default to Onion-only
+    // (owner preference — see `.cursor/rules/showcase-clips.mdc`).
+    let mut maps: Vec<String> = ofcore::curriculum::V10_BROAD_MAPS
+        .iter()
+        .filter(|m| **m != "Onion")
+        .map(|m| (*m).to_string())
+        .collect();
+    // Shuffle so generation / featured bias isn't fixed to list order.
+    maps.shuffle(&mut rand::thread_rng());
+    maps
+}
+
+/// Lobby density + difficulty for a V10 curriculum stage (bots, nations, label).
+///
+/// Showcase watches must match the stage table the policy is actually on —
+/// hardcoding stale Easy/24b/4n lobbies while the trainer is on denser stages
+/// (or later Medium/Hard) produces out-of-distribution clips.
+pub fn showcase_lobby_for_stage(stage: usize) -> (i64, i64, &'static str) {
+    use ofcore::curriculum::{
+        V10_BOT_NATION_DENSITY, V10_HARD_START, V10_IMPOSSIBLE_START, V10_MEDIUM_START,
+    };
+    let idx = stage.min(V10_BOT_NATION_DENSITY.len().saturating_sub(1));
+    let (bots, nations) = V10_BOT_NATION_DENSITY[idx];
+    let difficulty = if idx < V10_MEDIUM_START {
+        "Easy"
+    } else if idx < V10_HARD_START {
+        "Medium"
+    } else if idx < V10_IMPOSSIBLE_START {
+        "Hard"
+    } else {
+        "Impossible"
+    };
+    (i64::from(bots), i64::from(nations), difficulty)
+}
+
+/// When true (default), daemon/clip derive watch stage + lobby from the
+/// pulled policy's `latest.state.json` instead of stale STAGE/SHOWCASE_* envs.
+pub fn showcase_follow_policy() -> bool {
+    match std::env::var("SHOWCASE_FOLLOW_POLICY") {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !(t == "0" || t == "false" || t == "no" || t == "off")
+        }
+        Err(_) => true,
+    }
+}
+
+pub fn map_seed(map_name: &str) -> String {
+    map_name.to_ascii_lowercase().replace(' ', "_")
+}
+
+/// Convert a training/showcase map key (`BlackSea`) to the OpenFront
+/// `GameMapType` value accepted by adminbot (`"Black Sea"`).
+///
+/// Training and `oftrain --map` use enum keys; `/api/adminbot/create_game`
+/// validates against the string enum values from `Maps.gen.ts`.
+pub fn game_map_api_name(map_key: &str) -> String {
+    let key = map_key.trim();
+    if key.is_empty() || key.contains(' ') {
+        return key.to_string();
+    }
+    // Explicit overrides where camelCase-splitting is wrong.
+    match key {
+        "ArchipelagoSea" | "MilkyWay" | "SoutheastAsia" => return key.to_string(),
+        "GatewayToTheAtlantic" => return "Gateway to the Atlantic".into(),
+        "GulfOfStLawrence" => return "Gulf of St. Lawrence".into(),
+        "StraitOfGibraltar" => return "Strait of Gibraltar".into(),
+        "StraitOfHormuz" => return "Strait of Hormuz".into(),
+        "Tourney1" => return "Tourney 2 Teams".into(),
+        "Tourney2" => return "Tourney 3 Teams".into(),
+        "Tourney3" => return "Tourney 4 Teams".into(),
+        "Tourney4" => return "Tourney 8 Teams".into(),
+        _ => {}
+    }
+    let mut out = String::with_capacity(key.len() + 4);
+    for (i, ch) in key.chars().enumerate() {
+        if i > 0 && ch.is_ascii_uppercase() {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Pick the newest replay entry from `state["maps"]` (by `generated_at`).
+///
+/// Falls back to the last maps entry, then a legacy top-level `game_id`.
+pub fn featured_showcase_entry(state: &Value) -> Option<Value> {
+    if let Some(entries) = state.get("maps").and_then(|v| v.as_array()) {
+        if !entries.is_empty() {
+            let mut best: Option<&Value> = None;
+            let mut best_ts: &str = "";
+            for entry in entries {
+                let ts = entry
+                    .get("generated_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if best.is_none() || ts > best_ts {
+                    best = Some(entry);
+                    best_ts = ts;
+                }
+            }
+            // No timestamps: prefer the last entry (daemon appends in order).
+            if best_ts.is_empty() {
+                return entries.last().cloned();
+            }
+            return best.cloned();
+        }
+    }
+    if state.get("game_id").is_some() {
+        return Some(state.clone());
+    }
+    None
+}
+
+pub fn featured_game_id(state: &Value) -> Option<String> {
+    featured_showcase_entry(state)?
+        .get("game_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+pub fn hf_policy_paths(run_name: &str) -> (String, Option<String>) {
+    if LEGACY_POLICY_RUNS.contains(&run_name) {
+        return (format!("{run_name}/policy.pt"), None);
+    }
+    (
+        format!("{run_name}/latest.safetensors"),
+        Some(format!("{run_name}/latest.state.json")),
+    )
+}
+
+pub fn policy_meta(policy: &Path) -> Result<Value> {
+    let sha = {
+        let bytes = fs::read(policy).with_context(|| format!("read {}", policy.display()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())[..16].to_string()
+    };
+    let state = if policy.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+        let state_path = policy.with_file_name(format!(
+            "{}.state.json",
+            policy
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("latest")
+        ));
+        if !state_path.is_file() {
+            bail!("missing safetensors state metadata: {}", state_path.display());
+        }
+        serde_json::from_str(&fs::read_to_string(&state_path)?)?
+    } else if policy.extension().and_then(|e| e.to_str()) == Some("pt") {
+        let parent = policy
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if !LEGACY_POLICY_RUNS.contains(&parent) {
+            bail!(
+                "policy must be a current .safetensors checkpoint or an explicitly \
+                 legacy ppo_v5/ppo_v7 policy.pt"
+            );
+        }
+        // Legacy .pt meta is not loaded in Rust (no pickle). Emit sha only.
+        json!({})
+    } else {
+        bail!("unsupported policy artifact: {}", policy.display());
+    };
+    Ok(json!({
+        "policy_update": state.get("update"),
+        "policy_stage": state.get("stage"),
+        "policy_sha256": sha,
+    }))
+}
+
+pub fn write_json(path: &Path, state: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(state)? + "\n";
+    fs::write(path, text)?;
+    Ok(())
+}
+
+pub fn load_json(path: &Path) -> Result<Value> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let text = fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({})))
+}
+
+pub fn utc_now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+pub fn hero_clip_urls(state: &Value) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(entries) = state.get("hero_clips").and_then(|v| v.as_array()) {
+        for entry in entries {
+            if let Some(s) = entry.as_str() {
+                urls.push(if s.starts_with('/') {
+                    s.to_string()
+                } else {
+                    format!("/archive/clips/{s}")
+                });
+            } else if let Some(u) = entry.get("url").and_then(|v| v.as_str()) {
+                urls.push(u.to_string());
+            }
+        }
+    }
+    if !urls.is_empty() {
+        return urls;
+    }
+    let dir = clips_dir();
+    if dir.is_dir() {
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().and_then(|x| x.to_str()) == Some("webm"))
+                    .then(|| p.file_name()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        names.sort();
+        for name in names {
+            urls.push(format!("/archive/clips/{name}"));
+        }
+    }
+    urls
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn featured_picks_latest_map_entry() {
+        let state = json!({
+            "maps": [
+                {"game_id": "aaaaaaaa", "seed": "onion", "generated_at": "2026-01-01T00:00:00Z"},
+                {"game_id": "bbbbbbbb", "seed": "pangaea", "generated_at": "2026-07-01T12:00:00Z"},
+                {"game_id": "cccccccc", "seed": "asia", "generated_at": "2026-03-01T00:00:00Z"},
+            ]
+        });
+        let entry = featured_showcase_entry(&state).unwrap();
+        assert_eq!(entry["game_id"], "bbbbbbbb");
+    }
+
+    #[test]
+    fn featured_without_timestamps_uses_last_entry() {
+        let state = json!({
+            "maps": [
+                {"game_id": "aaaaaaaa", "seed": "onion"},
+                {"game_id": "bbbbbbbb", "seed": "pangaea"},
+            ]
+        });
+        let entry = featured_showcase_entry(&state).unwrap();
+        assert_eq!(entry["game_id"], "bbbbbbbb");
+    }
+
+    #[test]
+    fn featured_falls_back_to_legacy_game_id() {
+        let state = json!({"game_id": "deadbeef"});
+        let entry = featured_showcase_entry(&state).unwrap();
+        assert_eq!(entry["game_id"], "deadbeef");
+    }
+
+    #[test]
+    fn game_map_api_name_resolves_showcase_keys() {
+        assert_eq!(game_map_api_name("Onion"), "Onion");
+        assert_eq!(game_map_api_name("BlackSea"), "Black Sea");
+        assert_eq!(game_map_api_name("BetweenTwoSeas"), "Between Two Seas");
+        assert_eq!(game_map_api_name("Black Sea"), "Black Sea");
+    }
+
+    #[test]
+    fn showcase_lobby_tracks_v10_density_and_difficulty_bands() {
+        assert_eq!(showcase_lobby_for_stage(16), (26, 3, "Easy"));
+        assert_eq!(showcase_lobby_for_stage(23), (48, 5, "Easy"));
+        assert_eq!(showcase_lobby_for_stage(36), (90, 4, "Medium"));
+        assert_eq!(showcase_lobby_for_stage(50), (130, 6, "Hard"));
+        assert_eq!(showcase_lobby_for_stage(60), (155, 8, "Impossible"));
+    }
+}

@@ -1,0 +1,1379 @@
+//! Multi-tick land attack (TS `AttackExecution.ts` subset for hash parity).
+
+use super::flat_heap::FlatBinaryHeap;
+use super::ordered_tiles::OrderedTiles;
+use super::Execution;
+use crate::game::{Game, PlayerType};
+use crate::map::{TerrainType, TileRef};
+use crate::prng::PseudoRandom;
+
+pub struct AttackExecution {
+    owner_small_id: u16,
+    target_player_id: Option<String>,
+    start_troops: Option<f64>,
+    troops: f64,
+    target_small_id: u16,
+    target_is_player: bool,
+    to_conquer: FlatBinaryHeap,
+    border_tiles: OrderedTiles,
+    source_tile: Option<TileRef>,
+    remove_troops: bool,
+    random: PseudoRandom,
+    attack_id: String,
+    retreating: bool,
+    retreated: bool,
+    active: bool,
+    /// TS `Attack.isActive()` - false after `delete()` while exec stays active one tick.
+    attack_live: bool,
+    initialized: bool,
+}
+
+impl AttackExecution {
+    pub fn new(
+        owner_small_id: u16,
+        target_player_id: Option<String>,
+        start_troops: Option<f64>,
+    ) -> Self {
+        Self::new_with_source(owner_small_id, target_player_id, start_troops, None)
+    }
+
+    pub fn new_with_source(
+        owner_small_id: u16,
+        target_player_id: Option<String>,
+        start_troops: Option<f64>,
+        source_tile: Option<TileRef>,
+    ) -> Self {
+        Self {
+            owner_small_id,
+            target_player_id,
+            start_troops,
+            troops: 0.0,
+            target_small_id: 0,
+            target_is_player: false,
+            to_conquer: FlatBinaryHeap::new(1024),
+            border_tiles: OrderedTiles::default(),
+            source_tile,
+            remove_troops: source_tile.is_none(),
+            random: PseudoRandom::new(123),
+            attack_id: String::new(),
+            retreating: false,
+            retreated: false,
+            active: true,
+            attack_live: true,
+            initialized: false,
+        }
+    }
+
+    pub fn from_intent(
+        client_id: &str,
+        game: &Game,
+        troops: f64,
+        target_player_id: Option<String>,
+    ) -> Option<(u16, Option<String>, Option<f64>)> {
+        let owner = game.player_by_client_id(client_id)?;
+        Some((
+            owner.small_id,
+            target_player_id,
+            Some(troops),
+        ))
+    }
+}
+
+impl Execution for AttackExecution {
+    fn init(&mut self, game: &mut Game, tick: u32) {
+        if !self.active || self.initialized {
+            return;
+        }
+        self.initialized = true;
+
+        if game.in_spawn_phase() {
+            self.active = false;
+            return;
+        }
+
+        let Some(owner) = game.player_by_small_id(self.owner_small_id) else {
+            self.active = false;
+            return;
+        };
+        let owner_type = owner.player_type;
+        let owner_troops = owner.troops;
+
+        if let Some(ref tid) = self.target_player_id {
+            if !game.has_player(tid) {
+                self.active = false;
+                return;
+            }
+            let def = game.player_by_id(tid).unwrap();
+            let def_small_id = def.small_id;
+            let def_type = def.player_type;
+            if def_small_id == self.owner_small_id {
+                self.active = false;
+                return;
+            }
+            if game.is_friendly(self.owner_small_id, def_small_id) {
+                self.active = false;
+                return;
+            }
+            // TS `AttackExecution.init`: unconditional automatic temporary embargo (applied
+            // before the `canAttackPlayer` gate below, regardless of its outcome) when
+            // neither side is a raider Bot ("Don't let bots embargo since they can't trade
+            // anyway"). Also rejects any pending alliance request the target has outstanding
+            // toward the attacker.
+            if owner_type != PlayerType::Bot && def_type != PlayerType::Bot {
+                game.add_embargo(def_small_id, self.owner_small_id, true, tick);
+                game.reject_alliance_request(def_small_id, self.owner_small_id);
+            }
+            if !game.can_attack_player(self.owner_small_id, def_small_id) {
+                self.active = false;
+                return;
+            }
+            self.target_is_player = true;
+            self.target_small_id = def_small_id;
+        } else {
+            self.target_is_player = false;
+            self.target_small_id = game.terra_nullius_id();
+        }
+
+        let mut start = self.start_troops.unwrap_or_else(|| {
+            game.wire
+                .attack_amount(owner_type, owner_troops)
+        });
+        // TS `AttackExecution.init` only clamps `startTroops` to the owner's
+        // current troops inside `if (this.removeTroops)`. Boat-landed attacks
+        // (`removeTroops == false`) carry troops already deducted from the
+        // owner at boat departure, so clamping against the owner's unrelated
+        // current troop pool here would wrongly shrink them.
+        if self.remove_troops {
+            start = start.min(owner_troops as f64);
+            game.remove_troops(self.owner_small_id, start);
+        }
+        self.troops = start;
+        // TS `stats().attack(owner, target, startTroops)` - recorded before
+        // opposing-attack cancellation/merge, using the pre-merge start amount.
+        game.adjust_attacks_sent(self.owner_small_id, start);
+
+        if let Some(p) = game.player_by_small_id_mut(self.owner_small_id) {
+            self.attack_id = p.id_prng.next_id();
+        }
+        game.register_land_attack(&self.attack_id, self.owner_small_id, self.target_small_id);
+
+        if let Some(src) = self.source_tile {
+            self.add_neighbors(game, src, game.ticks());
+        } else {
+            self.refresh_to_conquer(game);
+        }
+
+        game.cancel_opposing_land_attacks(
+            self.owner_small_id,
+            self.target_small_id,
+            &self.attack_id,
+            &mut self.troops,
+            &mut self.active,
+        );
+        if !self.active {
+            self.kill_attack(game);
+            return;
+        }
+        if self.source_tile.is_none() {
+            game.merge_outgoing_land_attacks(
+                self.owner_small_id,
+                self.target_small_id,
+                &self.attack_id,
+                &mut self.troops,
+            );
+        }
+
+        if self.target_is_player {
+            let difficulty = game.wire.game_config().difficulty.as_str();
+            let delta = match difficulty {
+                "Easy" => -60,
+                "Medium" => -70,
+                "Hard" => -80,
+                "Impossible" => -100,
+                _ => -70,
+            };
+            // TS `AttackExecution.init`: `this.target.updateRelation(this._owner,
+            // relationChange)` - updates the TARGET's relation toward the OWNER
+            // (getting attacked makes the victim more hostile), not the other
+            // way around. `update_relation(a, b, ..)` updates a's relation
+            // toward b, so the call is `(target, owner, ..)`, not `(owner,
+            // target, ..)` (previously swapped - see the bots=5
+            // curriculum-parity bisection this was found from).
+            game.update_relation(self.target_small_id, self.owner_small_id, delta);
+        }
+    }
+
+    fn tick(&mut self, game: &mut Game, tick: u32) {
+        if !self.active || !self.initialized {
+            return;
+        }
+        if self.retreated {
+            let malus = if self.target_is_player { 25.0 } else { 0.0 };
+            self.retreat(game, malus);
+            return;
+        }
+        if !self.attack_live {
+            self.active = false;
+            return;
+        }
+        if self.retreating {
+            return;
+        }
+
+        if self.target_is_player {
+            if game.is_friendly(self.owner_small_id, self.target_small_id) {
+                // TS only applies the 25% malus to an explicitly canceled
+                // player attack. An alliance formed after launch causes an
+                // automatic retreat with every remaining troop returned.
+                self.retreat(game, 0.0);
+                return;
+            }
+        }
+
+        let mut troop_count = self.troops;
+        let owner_type = game
+            .player_by_small_id(self.owner_small_id)
+            .map(|p| p.player_type)
+            .unwrap_or(PlayerType::Human);
+
+        let mut num_tiles_per_tick = {
+            let border_size = self.border_tiles.len() as f64;
+            let defender_troops = if self.target_is_player {
+                game.player_by_small_id(self.target_small_id)
+                    .map(|p| p.troops)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            game.wire.attack_tiles_per_tick(
+                troop_count,
+                owner_type,
+                self.target_is_player,
+                defender_troops,
+                border_size + self.random.next_int(0, 5) as f64,
+            )
+        };
+
+        while num_tiles_per_tick > 0.0 {
+            if troop_count < 1.0 {
+                self.kill_attack(game);
+                self.active = false;
+                return;
+            }
+
+            if self.to_conquer.is_empty() {
+                self.refresh_to_conquer(game);
+                self.troops = troop_count;
+                self.retreat(game, 0.0);
+                return;
+            }
+
+            let Some(tile_to_conquer) = self.to_conquer.dequeue() else {
+                break;
+            };
+
+            self.remove_border_tile(tile_to_conquer);
+
+            let mut on_border = false;
+            game.map.for_each_neighbor4(tile_to_conquer, |n| {
+                if game.map.owner_id(n) == self.owner_small_id {
+                    on_border = true;
+                }
+            });
+
+            if game.map.owner_id(tile_to_conquer) != self.target_small_id || !on_border {
+                continue;
+            }
+            // Tip `AttackExecution.tick`: land-only guard (impassable removed).
+            if !game.is_land(tile_to_conquer) {
+                continue;
+            }
+
+            self.add_neighbors(game, tile_to_conquer, tick);
+
+            let terrain = game.terrain_type(tile_to_conquer);
+            let (attacker_loss, defender_loss, tiles_used) = if self.target_is_player {
+                game.attack_logic_at_tile(
+                    troop_count,
+                    self.owner_small_id,
+                    self.target_small_id,
+                    tile_to_conquer,
+                    true,
+                )
+            } else {
+                game.attack_logic_at_tile(
+                    troop_count,
+                    self.owner_small_id,
+                    self.target_small_id,
+                    tile_to_conquer,
+                    false,
+                )
+            };
+
+            num_tiles_per_tick -= tiles_used;
+            troop_count -= attacker_loss;
+            self.set_troops(troop_count);
+
+            if self.target_is_player {
+                game.remove_troops(self.target_small_id, defender_loss);
+            }
+            game.conquer(self.owner_small_id, tile_to_conquer);
+            self.handle_dead_defender(game);
+        }
+        self.set_troops(troop_count);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn active_during_spawn(&self) -> bool {
+        false
+    }
+
+    fn as_attack(&mut self) -> Option<&mut AttackExecution> {
+        Some(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::Player;
+
+    #[test]
+    fn alliance_formed_mid_attack_returns_all_remaining_troops() {
+        let mut game = Game::default();
+        game.add_player(Player {
+            id: "attacker".to_string(),
+            small_id: 1,
+            troops: 1_000,
+            team: Some("Blue".to_string()),
+            ..Default::default()
+        });
+        game.add_player(Player {
+            id: "target".to_string(),
+            small_id: 2,
+            team: Some("Blue".to_string()),
+            ..Default::default()
+        });
+
+        let mut attack = AttackExecution::new(1, Some("target".to_string()), Some(400.0));
+        attack.initialized = true;
+        attack.target_is_player = true;
+        attack.target_small_id = 2;
+        attack.troops = 400.0;
+
+        attack.tick(&mut game, 1);
+
+        assert_eq!(game.player_by_small_id(1).unwrap().troops, 1_400);
+        assert!(!attack.is_active());
+    }
+
+    #[test]
+    fn retreated_attack_deleted_by_same_tick_merge_still_returns_survivors() {
+        let mut game = Game::default();
+        game.add_player(Player {
+            id: "attacker".to_string(),
+            small_id: 1,
+            troops: 1_000,
+            ..Default::default()
+        });
+        game.add_player(Player {
+            id: "target".to_string(),
+            small_id: 2,
+            ..Default::default()
+        });
+
+        let mut attack = AttackExecution::new(1, Some("target".to_string()), Some(120.0));
+        attack.initialized = true;
+        attack.target_is_player = true;
+        attack.target_small_id = 2;
+        attack.troops = 120.0;
+        attack.retreating = true;
+        attack.retreated = true;
+        // TS checks `retreated()` before `isActive()`. This matters when a
+        // same-tick outgoing merge deletes a just-executed retreat before the
+        // old AttackExecution gets its next tick.
+        attack.attack_live = false;
+
+        attack.tick(&mut game, 1);
+
+        assert_eq!(game.player_by_small_id(1).unwrap().troops, 1_090);
+        assert!(!attack.is_active());
+    }
+
+    #[test]
+    fn boat_landed_attack_cancels_opposing_land_attack() {
+        let mut game = Game::default();
+        game.end_spawn_phase();
+        game.add_player(Player {
+            id: "attacker".to_string(),
+            small_id: 1,
+            player_type: PlayerType::Bot,
+            troops: 1_000,
+            tiles_owned: 1,
+            id_prng: PseudoRandom::new(1),
+            ..Default::default()
+        });
+        game.add_player(Player {
+            id: "defender".to_string(),
+            small_id: 2,
+            player_type: PlayerType::Bot,
+            troops: 1_000,
+            tiles_owned: 1,
+            id_prng: PseudoRandom::new(2),
+            ..Default::default()
+        });
+        game.add_execution(crate::execution::ExecEnum::Attack(AttackExecution::new(
+            1,
+            Some("defender".to_string()),
+            Some(100.0),
+        )));
+        game.add_execution(crate::execution::ExecEnum::Attack(
+            AttackExecution::new_with_source(
+                2,
+                Some("attacker".to_string()),
+                Some(40.0),
+                Some(0),
+            ),
+        ));
+
+        game.execute_next_tick();
+
+        let attacks = game.active_attacks_debug();
+        assert_eq!(attacks.len(), 2);
+        assert_eq!(attacks[0].0, 1);
+        assert_eq!(attacks[0].1, 2);
+        assert!(
+            (attacks[0].2 - 60.0).abs() < f64::EPSILON,
+            "unexpected attacks: {attacks:?}"
+        );
+        assert!(attacks[0].4);
+        assert_eq!(attacks[1].0, 2);
+        assert_eq!(attacks[1].1, 1);
+        assert!(!attacks[1].3);
+        assert!(!attacks[1].4);
+    }
+
+    // Ported from Disconnected.test.ts "Player can attack disconnected team
+    // mate without troop loss": a disconnected teammate is still a valid
+    // attack target (isFriendly/is_friendly excludes disconnected players by
+    // default), and fully eliminating them - as opposed to an explicit
+    // order-retreat - returns all remaining troops with 0 malus.
+    #[test]
+    fn full_conquest_of_disconnected_team_mate_returns_troops_with_no_malus() {
+        let mut game = Game::default();
+        game.map = crate::map::GameMap::from_terrain_bytes(
+            &crate::map::MapMeta {
+                width: 10,
+                height: 10,
+                num_land_tiles: 100,
+            },
+            &vec![0x80u8; 100],
+        )
+        .unwrap();
+        game.end_spawn_phase();
+
+        game.add_player(Player {
+            id: "attacker".to_string(),
+            small_id: 1,
+            player_type: PlayerType::Human,
+            team: Some("T".to_string()),
+            troops: 10_000,
+            ..Default::default()
+        });
+        game.add_player(Player {
+            id: "defender".to_string(),
+            small_id: 2,
+            player_type: PlayerType::Human,
+            team: Some("T".to_string()),
+            troops: 100,
+            is_disconnected: true,
+            ..Default::default()
+        });
+
+        for x in 0..10u32 {
+            for y in 0..10u32 {
+                let t = game.ref_xy(x, y);
+                if x == 9 && y == 9 {
+                    game.conquer(2, t);
+                } else {
+                    game.conquer(1, t);
+                }
+            }
+        }
+
+        // Human targets are immune for `spawn_immunity_duration()` (50 ticks)
+        // after spawn phase ends; advance past it so `init()` doesn't reject
+        // the attack outright.
+        for _ in 0..60 {
+            game.execute_next_tick();
+        }
+
+        let troops_before_attack = game.player_by_small_id(1).unwrap().troops;
+        let start_troops = troops_before_attack as f64 * 0.25;
+        game.add_execution(crate::execution::ExecEnum::Attack(AttackExecution::new(
+            1,
+            Some("defender".to_string()),
+            Some(start_troops),
+        )));
+
+        for _ in 0..2_000 {
+            if game.player_by_small_id(2).unwrap().tiles_owned == 0 {
+                break;
+            }
+            game.execute_next_tick();
+        }
+        assert_eq!(game.player_by_small_id(2).unwrap().tiles_owned, 0);
+        // retreat() fires the tick after the last tile is conquered (toConquer
+        // empties, refresh finds nothing, then retreat).
+        game.execute_next_tick();
+
+        assert!(game.player_by_small_id(1).unwrap().troops >= troops_before_attack);
+    }
+
+    // TS `NeighborIteration.test.ts` "Conquer border invariants" describe
+    // block: for every player, `borderTiles` must be a subset of `tiles`,
+    // and a tile is a border tile iff some in-bounds cardinal neighbor has a
+    // different owner - checked repeatedly during a live multi-tick land
+    // grab/fight, not just once at the end. Exercises the exact combination
+    // (`for_each_neighbor4` order + `AttackExecution`'s conquest-frontier
+    // maintenance in `add_border_tile`/`remove_border_tile`/
+    // `game.refresh_borders_around`) that the prior neighbor-order
+    // bisections targeted.
+    fn check_border_invariant(game: &Game) {
+        for p in game.players_in_order() {
+            for t in p.border_tiles.iter() {
+                assert!(
+                    p.owned_tiles.contains(&t),
+                    "player {}: border tile {t} not in owned tiles",
+                    p.id
+                );
+            }
+            for &t in &p.owned_tiles {
+                let mut is_border = false;
+                game.map.for_each_neighbor4(t, |n| {
+                    if game.map.owner_id(n) != p.small_id {
+                        is_border = true;
+                    }
+                });
+                assert_eq!(
+                    p.border_tiles.contains(t),
+                    is_border,
+                    "player {}: border-status mismatch at tile {t}",
+                    p.id
+                );
+            }
+        }
+    }
+
+    fn bot_player(id: &str, small_id: u16, id_prng_seed: i32) -> Player {
+        Player {
+            id: id.to_string(),
+            small_id,
+            player_type: PlayerType::Bot,
+            troops: 1_000_000,
+            id_prng: PseudoRandom::new(id_prng_seed),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn border_invariant_holds_after_expanding_into_terra_nullius() {
+        let mut game = crate::test_util::plains_game(40, 40);
+        game.add_player(bot_player("attacker", 1, 1));
+        game.conquer(1, game.map.ref_xy(0, 0));
+
+        game.add_execution(crate::execution::ExecEnum::Attack(AttackExecution::new(
+            1,
+            None,
+            Some(1000.0),
+        )));
+        for _ in 0..30 {
+            game.execute_next_tick();
+        }
+
+        assert!(game.player_by_small_id(1).unwrap().tiles_owned > 10);
+        check_border_invariant(&game);
+    }
+
+    #[test]
+    fn border_invariant_holds_while_two_players_fight_over_territory() {
+        let mut game = crate::test_util::plains_game(40, 40);
+        game.add_player(bot_player("attacker", 1, 1));
+        game.add_player(bot_player("defender", 2, 2));
+        game.conquer(1, game.map.ref_xy(0, 0));
+        game.conquer(2, game.map.ref_xy(30, 30));
+
+        game.add_execution(crate::execution::ExecEnum::Attack(AttackExecution::new(
+            1,
+            None,
+            Some(500.0),
+        )));
+        game.add_execution(crate::execution::ExecEnum::Attack(AttackExecution::new(
+            2,
+            None,
+            Some(500.0),
+        )));
+        for _ in 0..40 {
+            game.execute_next_tick();
+        }
+
+        game.add_execution(crate::execution::ExecEnum::Attack(AttackExecution::new(
+            1,
+            Some("defender".to_string()),
+            Some(5000.0),
+        )));
+        // Check the invariant repeatedly while the fight is in progress, not
+        // just at the end.
+        for i in 0..40 {
+            game.execute_next_tick();
+            if i % 10 == 0 {
+                check_border_invariant(&game);
+            }
+        }
+        assert!(game.player_by_small_id(1).unwrap().tiles_owned > 10);
+        check_border_invariant(&game);
+    }
+
+    #[test]
+    fn conquering_terra_nullius_updates_owner_and_neighbors_border_status() {
+        let mut game = crate::test_util::plains_game(40, 40);
+        game.add_player(bot_player("attacker", 1, 1));
+        game.conquer(1, game.map.ref_xy(0, 0));
+
+        game.add_execution(crate::execution::ExecEnum::Attack(AttackExecution::new(
+            1,
+            None,
+            Some(1000.0),
+        )));
+        for _ in 0..30 {
+            game.execute_next_tick();
+        }
+
+        for &t in &game.player_by_small_id(1).unwrap().owned_tiles {
+            assert_eq!(game.map.owner_id(t), 1);
+        }
+        check_border_invariant(&game);
+    }
+
+    /// TS `ImpassableTerrain.test.ts` "attack does not expand into
+    /// impassable tiles": already covered defensively by
+    /// `AttackExecution::tick`'s `!game.is_land(...) ||
+    /// game.is_impassable(...)` skip (see that check's doc comment) and
+    /// `add_neighbors`'s matching `is_impassable` exclusion - this pins the
+    /// end-to-end behavior through a real multi-tick fight across a wall.
+    #[test]
+    #[ignore = "tip dd1277 removed impassable terrain"]
+    fn attack_does_not_expand_into_impassable_tiles() {
+        const WALL_X: u32 = 30;
+        let mut game = crate::test_util::walled_game(60, 20, Some((WALL_X, 2)));
+        game.add_player(bot_player("attacker", 1, 1));
+        game.add_player(bot_player("other", 2, 2));
+        // Other player owns tiles adjacent to the wall on the right side.
+        for y in 8..=12 {
+            game.conquer(2, game.map.ref_xy(WALL_X + 2, y));
+        }
+        // Attacker owns tiles on the left side, also adjacent to the wall.
+        for y in 8..=12 {
+            game.conquer(1, game.map.ref_xy(WALL_X - 2, y));
+        }
+
+        game.add_execution(crate::execution::ExecEnum::Attack(AttackExecution::new(
+            1,
+            Some("other".to_string()),
+            Some(1000.0),
+        )));
+        for _ in 0..50 {
+            game.execute_next_tick();
+        }
+
+        for y in 8..=12 {
+            assert_ne!(game.map.owner_id(game.map.ref_xy(WALL_X, y)), 1);
+            assert_ne!(game.map.owner_id(game.map.ref_xy(WALL_X + 1, y)), 1);
+        }
+    }
+
+    // Ported from AttackStats.test.ts. TS tracks a detailed per-category gold
+    // ledger (`GOLD_INDEX_WAR`/`GOLD_INDEX_WORK` in `StatsImpl`) purely for UI
+    // display; native has no such stats subsystem at all (see
+    // docs/bot-ai-parity-nation-relations/README.md's documented "dead for
+    // this dataset" carve-outs for similar UI-only bookkeeping). What IS
+    // gameplay-relevant and ported here is the underlying mechanic those
+    // stats are derived from: `Game::conquer_player`'s actual gold transfer,
+    // and its "conquered player never attacked anyone" skip condition (TS
+    // `GameImpl.conquerPlayer`'s `skipGoldTransfer`, tracked via
+    // `attacks_sent_net`/TS's `ATTACK_INDEX_SENT`). TS's third test
+    // ("...via territory annexation") exercises this exact same
+    // `conquerPlayer` code path with different map geometry leading to the
+    // same elimination trigger - not re-ported separately since native's
+    // `handle_dead_defender` doesn't distinguish how a defender's tiles
+    // dropped below the elimination threshold.
+    #[test]
+    fn conqueror_receives_half_a_human_defenders_gold_on_elimination() {
+        let mut game = Game::default();
+        game.add_player(Player {
+            id: "attacker".to_string(),
+            small_id: 1,
+            gold: 0,
+            ..Default::default()
+        });
+        game.add_player(Player {
+            id: "defender".to_string(),
+            small_id: 2,
+            gold: 100,
+            ..Default::default()
+        });
+        // TS: "Player2 must attack to be considered active (otherwise gold
+        // won't transfer)".
+        game.adjust_attacks_sent(2, 50.0);
+
+        game.conquer_player(1, 2);
+
+        assert_eq!(game.player_by_small_id(1).unwrap().gold, 50);
+        assert_eq!(game.player_by_small_id(2).unwrap().gold, 0);
+    }
+
+    #[test]
+    fn no_gold_transfers_when_an_inactive_human_defender_is_eliminated() {
+        let mut game = Game::default();
+        game.add_player(Player {
+            id: "attacker".to_string(),
+            small_id: 1,
+            gold: 0,
+            ..Default::default()
+        });
+        game.add_player(Player {
+            id: "defender".to_string(),
+            small_id: 2,
+            gold: 100,
+            ..Default::default()
+        });
+
+        game.conquer_player(1, 2);
+
+        assert_eq!(game.player_by_small_id(1).unwrap().gold, 0);
+        assert_eq!(game.player_by_small_id(2).unwrap().gold, 100);
+    }
+
+    fn add_human(game: &mut Game, id: &str) -> u16 {
+        game.add_from_info(&crate::game::PlayerInfo {
+            name: id.into(),
+            player_type: PlayerType::Human,
+            client_id: Some(id.into()),
+            id: id.into(),
+            clan_tag: None,
+            friends: Vec::new(),
+            team: None,
+        })
+    }
+
+    // Ported from Attack.test.ts's "Should not mark attacker as traitor when
+    // alliance is formed after attack starts": an alliance created and
+    // accepted *after* both attacks are already in flight retreats both
+    // (via the `is_friendly` check in `tick()`, not `init()` - the attacks
+    // were already live before the alliance existed) without either side
+    // being marked a traitor, since neither ever attacked an existing ally
+    // (`mark_traitor` is only reachable via `break_alliance_between`/
+    // `break_alliance_silently`, never from `AttackExecution` itself).
+    #[test]
+    fn alliance_formed_after_both_attacks_launch_retreats_both_without_marking_a_traitor() {
+        use crate::execution::ExecEnum;
+
+        let mut game = Game::default();
+        game.end_spawn_phase();
+        let a = add_human(&mut game, "a");
+        let b = add_human(&mut game, "b");
+        if let Some(p) = game.player_by_small_id_mut(a) {
+            p.troops = 1_000;
+        }
+        if let Some(p) = game.player_by_small_id_mut(b) {
+            p.troops = 1_000;
+        }
+        assert!(game.create_alliance_request(a, b, game.ticks()));
+
+        game.add_execution(ExecEnum::Attack(AttackExecution::new(
+            a,
+            Some("b".to_string()),
+            Some(100.0),
+        )));
+        game.add_execution(ExecEnum::Attack(AttackExecution::new(
+            b,
+            Some("a".to_string()),
+            Some(100.0),
+        )));
+        game.accept_alliance_request(a, b, game.ticks());
+
+        for _ in 0..5 {
+            game.execute_next_tick();
+        }
+
+        assert!(game.is_allied_with(a, b));
+        assert!(game.is_allied_with(b, a));
+        assert!(!game.is_traitor(a));
+        assert!(!game.is_traitor(b));
+        assert_eq!(
+            game.active_attacks_debug()
+                .iter()
+                .filter(|t| t.3)
+                .count(),
+            0
+        );
+    }
+
+    // Ported from Attack.test.ts's "Should prevent player from attacking
+    // allied player": `AttackExecution::init`'s `is_friendly` gate blocks the
+    // attack outright, so no attack ever becomes live on either side.
+    #[test]
+    fn attacking_an_allied_player_is_blocked() {
+        let mut game = Game::default();
+        game.end_spawn_phase();
+        let a = add_human(&mut game, "a");
+        let b = add_human(&mut game, "b");
+        assert!(game.create_alliance_request(a, b, 0));
+        game.accept_alliance_request(a, b, 0);
+        assert!(game.is_allied_with(a, b));
+
+        let mut attack = AttackExecution::new(a, Some("b".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(!attack.is_active());
+    }
+
+    // Ported from Attack.test.ts's "Should cancel alliance requests if the
+    // recipient attacks": B attacking A revokes A's pending outgoing request
+    // toward B, via the `reject_alliance_request` call in
+    // `AttackExecution::init` (see the call site's comment further up this
+    // file - this is the land-attack half of the same rule
+    // `TransportShipExecution::init` mirrors for boats).
+    #[test]
+    fn attacking_a_player_cancels_their_pending_alliance_request_toward_the_attacker() {
+        let mut game = Game::default();
+        game.end_spawn_phase();
+        let a = add_human(&mut game, "a");
+        let b = add_human(&mut game, "b");
+        assert!(game.create_alliance_request(a, b, 0));
+        assert_eq!(game.incoming_alliance_requests(b).len(), 1);
+
+        let mut attack = AttackExecution::new(b, Some("a".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert_eq!(game.outgoing_alliance_requests(a).len(), 0);
+        assert_eq!(game.incoming_alliance_requests(b).len(), 0);
+    }
+
+    // Ported from Attack.test.ts's "Should cancel the proper alliance
+    // request among many": B attacking A only revokes A's request to B, not
+    // C's unrelated request to B.
+    #[test]
+    fn attacking_cancels_only_the_matching_alliance_request_among_many() {
+        let mut game = Game::default();
+        game.end_spawn_phase();
+        let a = add_human(&mut game, "a");
+        let b = add_human(&mut game, "b");
+        let c = add_human(&mut game, "c");
+        assert!(game.create_alliance_request(a, b, 0));
+        assert!(game.create_alliance_request(c, b, 0));
+        assert_eq!(game.incoming_alliance_requests(b).len(), 2);
+
+        let mut attack = AttackExecution::new(b, Some("a".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert_eq!(game.outgoing_alliance_requests(a).len(), 0);
+        assert_eq!(game.incoming_alliance_requests(b).len(), 1);
+    }
+}
+
+// Ported from Attack.test.ts's "Attack immunity" describe block. TS's
+// `TestConfig.setNationSpawnImmunityDuration` overrides
+// `nationSpawnImmunityDuration()` purely for faster tests - production
+// `Config.nationSpawnImmunityDuration()` always returns the fixed default (50
+// ticks) regardless of game config, exactly like native's
+// `WireConfig::nation_spawn_immunity_duration()`. So nation-immunity tests
+// here use the real default duration instead of TS's shortened test-only
+// value; human spawn-immunity tests use `spawn_immunity_duration`, which IS
+// wire-configurable in production, via the same `GameConfig` override pattern
+// `alliance_accept_nukes_tests` (in `game.rs`) uses for its custom map.
+#[cfg(test)]
+mod immunity_tests {
+    use super::*;
+    use crate::game::PlayerInfo;
+
+    const IMMUNITY_TICKS: u32 = 10;
+
+    fn game_with_spawn_immunity(ticks: u32) -> Game {
+        let mut game = Game::default();
+        let wire_cfg = crate::core::schemas::GameConfig {
+            game_map: "Onion".into(),
+            difficulty: "Medium".into(),
+            donate_gold: false,
+            donate_troops: false,
+            game_type: "Singleplayer".into(),
+            game_mode: "Free For All".into(),
+            game_map_size: "Normal".into(),
+            nations: crate::core::schemas::NationsConfig::Mode("default".into()),
+            bots: 0,
+            infinite_gold: false,
+            infinite_troops: false,
+            instant_build: false,
+            random_spawn: false,
+            doomsday_clock: None,
+            disabled_units: None,
+            player_teams: None,
+            disable_alliances: None,
+            spawn_immunity_duration: Some(ticks),
+            starting_gold: None,
+            gold_multiplier: None,
+            max_timer_value: None,
+            ranked_type: None,
+            water_nukes: None,
+        };
+        game.wire = crate::core::config::Config::new(wire_cfg, false);
+        game.end_spawn_phase();
+        game
+    }
+
+    fn add(game: &mut Game, id: &str, player_type: PlayerType) -> u16 {
+        game.add_from_info(&PlayerInfo {
+            name: id.into(),
+            player_type,
+            client_id: Some(id.into()),
+            id: id.into(),
+            clan_tag: None,
+            friends: Vec::new(),
+            team: None,
+        })
+    }
+
+    #[test]
+    fn human_cannot_attack_human_during_spawn_immunity() {
+        let mut game = game_with_spawn_immunity(IMMUNITY_TICKS);
+        let a = add(&mut game, "a", PlayerType::Human);
+        add(&mut game, "b", PlayerType::Human);
+
+        let mut attack = AttackExecution::new(a, Some("b".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(!attack.is_active());
+    }
+
+    #[test]
+    fn human_can_attack_human_after_spawn_immunity_ends() {
+        let mut game = game_with_spawn_immunity(IMMUNITY_TICKS);
+        let a = add(&mut game, "a", PlayerType::Human);
+        add(&mut game, "b", PlayerType::Human);
+        for _ in 0..IMMUNITY_TICKS + 1 {
+            game.execute_next_tick();
+        }
+
+        let mut attack = AttackExecution::new(a, Some("b".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(attack.is_active());
+    }
+
+    // Ported from "Ensure a player can't attack during all the immunity
+    // phase": checks the exact boundary tick, not just well before/after it.
+    // Goes through `add_execution`+`execute_next_tick` (rather than a direct
+    // `.init()` call like the other tests here) so the attack's init runs at
+    // the same pre-increment tick TS's `executeNextTick` uses, matching the
+    // TS test's own tick-by-tick comments exactly.
+    #[test]
+    fn human_cannot_attack_until_the_immunity_window_fully_elapses() {
+        use crate::execution::ExecEnum;
+
+        let mut game = game_with_spawn_immunity(IMMUNITY_TICKS);
+        let a = add(&mut game, "a", PlayerType::Human);
+        add(&mut game, "b", PlayerType::Human);
+        for _ in 0..IMMUNITY_TICKS - 2 {
+            game.execute_next_tick();
+        }
+
+        game.add_execution(ExecEnum::Attack(AttackExecution::new(
+            a,
+            Some("b".to_string()),
+            Some(10.0),
+        )));
+        game.execute_next_tick(); // ticks == IMMUNITY_TICKS - 1 now
+        assert_eq!(
+            game.active_attacks_debug()
+                .iter()
+                .filter(|t| t.0 == a && t.3)
+                .count(),
+            0
+        );
+
+        game.execute_next_tick(); // ticks == IMMUNITY_TICKS now
+        game.add_execution(ExecEnum::Attack(AttackExecution::new(
+            a,
+            Some("b".to_string()),
+            Some(10.0),
+        )));
+        game.execute_next_tick();
+        assert_eq!(
+            game.active_attacks_debug()
+                .iter()
+                .filter(|t| t.0 == a && t.3)
+                .count(),
+            1
+        );
+    }
+
+    // Ported from "Should be able to attack bots during immunity phase": a
+    // Bot target has no immunity type of its own in `is_player_immune`
+    // (only `Human`/`Nation` match), so it's attackable at any time
+    // regardless of which type the attacker is - distinct from the
+    // `bot_can_attack_human_during_spawn_immunity` case below, which instead
+    // exercises `can_attack_player`'s "non-human attacker bypasses immunity"
+    // branch.
+    #[test]
+    fn human_can_attack_a_bot_during_spawn_immunity() {
+        let mut game = game_with_spawn_immunity(IMMUNITY_TICKS);
+        let human = add(&mut game, "human", PlayerType::Human);
+        add(&mut game, "bot", PlayerType::Bot);
+
+        let mut attack = AttackExecution::new(human, Some("bot".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(attack.is_active());
+    }
+
+    #[test]
+    fn bot_can_attack_human_during_spawn_immunity() {
+        let mut game = game_with_spawn_immunity(IMMUNITY_TICKS);
+        let bot = add(&mut game, "bot", PlayerType::Bot);
+        add(&mut game, "human", PlayerType::Human);
+
+        let mut attack = AttackExecution::new(bot, Some("human".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(attack.is_active());
+    }
+
+    #[test]
+    fn nation_can_attack_human_during_pvp_immunity() {
+        let mut game = game_with_spawn_immunity(IMMUNITY_TICKS);
+        let nation = add(&mut game, "nation", PlayerType::Nation);
+        add(&mut game, "human", PlayerType::Human);
+
+        let mut attack = AttackExecution::new(nation, Some("human".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(attack.is_active());
+    }
+
+    #[test]
+    fn nation_can_attack_nation_during_pvp_immunity() {
+        let mut game = game_with_spawn_immunity(IMMUNITY_TICKS);
+        let a = add(&mut game, "nation_a", PlayerType::Nation);
+        add(&mut game, "nation_b", PlayerType::Nation);
+
+        let mut attack = AttackExecution::new(a, Some("nation_b".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(attack.is_active());
+    }
+
+    // Ported from "Nation cannot attack allied human during PVP immunity":
+    // a nation bypasses immunity but not the ordinary friendliness gate.
+    #[test]
+    fn nation_cannot_attack_an_allied_human_during_pvp_immunity() {
+        let mut game = game_with_spawn_immunity(IMMUNITY_TICKS);
+        let nation = add(&mut game, "nation", PlayerType::Nation);
+        let human = add(&mut game, "human", PlayerType::Human);
+        assert!(game.create_alliance_request(nation, human, 0));
+        game.accept_alliance_request(nation, human, 0);
+        assert!(game.is_allied_with(nation, human));
+
+        let mut attack = AttackExecution::new(nation, Some("human".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(!attack.is_active());
+    }
+
+    #[test]
+    fn human_cannot_attack_nation_during_nation_spawn_immunity() {
+        let mut game = Game::default();
+        game.end_spawn_phase();
+        let human = add(&mut game, "human", PlayerType::Human);
+        add(&mut game, "nation", PlayerType::Nation);
+
+        let mut attack = AttackExecution::new(human, Some("nation".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(!attack.is_active());
+    }
+
+    #[test]
+    fn human_can_attack_nation_after_nation_spawn_immunity_ends() {
+        let mut game = Game::default();
+        game.end_spawn_phase();
+        let human = add(&mut game, "human", PlayerType::Human);
+        add(&mut game, "nation", PlayerType::Nation);
+        let duration = game.wire.nation_spawn_immunity_duration();
+        for _ in 0..duration + 1 {
+            game.execute_next_tick();
+        }
+
+        let mut attack = AttackExecution::new(human, Some("nation".to_string()), Some(10.0));
+        let tick = game.ticks();
+        attack.init(&mut game, tick);
+
+        assert!(attack.is_active());
+    }
+}
+
+impl AttackExecution {
+    pub fn attack_id(&self) -> &str {
+        &self.attack_id
+    }
+
+    pub fn order_retreat(&mut self) {
+        self.retreating = true;
+    }
+
+    /// TS `Attack.retreating()` - read by the RL obs attacks list.
+    pub fn retreating(&self) -> bool {
+        self.retreating
+    }
+
+    pub fn execute_retreat(&mut self) {
+        self.retreated = true;
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub fn owner_small_id(&self) -> u16 {
+        self.owner_small_id
+    }
+
+    pub fn target_small_id(&self) -> u16 {
+        self.target_small_id
+    }
+
+    pub fn troops(&self) -> f64 {
+        self.troops
+    }
+
+    pub fn source_tile(&self) -> Option<TileRef> {
+        self.source_tile
+    }
+
+    /// TS `Attack.setTroops()` clamps to non-negative. Without this, a tick
+    /// that overshoots troop_count into negative territory leaves the attack
+    /// permanently stuck with negative troops (the top-of-loop `troop_count <
+    /// 1.0` guard never re-fires once `num_tiles_per_tick` hits zero), and that
+    /// negative balance later gets silently absorbed into a merged attack's
+    /// troop count, desyncing from TS which never lets it go negative.
+    pub fn set_troops(&mut self, troops: f64) {
+        self.troops = troops.max(0.0);
+    }
+
+    pub fn deactivate(&mut self) {
+        self.active = false;
+    }
+
+    pub fn attack_live(&self) -> bool {
+        self.attack_live
+    }
+
+    pub fn border_tile_count(&self) -> usize {
+        self.border_tiles.len()
+    }
+
+    pub fn to_conquer_len(&self) -> usize {
+        self.to_conquer.len()
+    }
+
+    /// TS `Attack.delete()` - remove from outgoing/incoming registries, defer exec cleanup.
+    pub fn kill_attack(&mut self, game: &mut Game) {
+        if self.attack_live {
+            game.unregister_land_attack(
+                &self.attack_id,
+                self.owner_small_id,
+                self.target_small_id,
+            );
+        }
+        self.attack_live = false;
+    }
+
+    pub fn can_merge_with(&self, owner_small_id: u16, target_player_id: &Option<String>) -> bool {
+        self.owner_small_id == owner_small_id && &self.target_player_id == target_player_id
+    }
+
+    pub fn absorb_pending_troops(&mut self, extra: Option<f64>) {
+        let add = extra.unwrap_or(0.0);
+        if add <= 0.0 {
+            return;
+        }
+        match self.start_troops {
+            Some(v) => self.start_troops = Some(v + add),
+            None => self.start_troops = Some(add),
+        }
+    }
+
+    pub fn absorb_troops(&mut self, game: &mut Game, extra: Option<f64>) {
+        let Some(owner) = game.player_by_small_id(self.owner_small_id).cloned() else {
+            return;
+        };
+        let add = extra.unwrap_or_else(|| {
+            game.wire.attack_amount(owner.player_type, owner.troops)
+        });
+        let add = add.min(owner.troops as f64);
+        if add < 1.0 {
+            return;
+        }
+        game.remove_troops(self.owner_small_id, add);
+        self.troops += add;
+    }
+
+    fn retreat(&mut self, game: &mut Game, malus_percent: f64) {
+        let deaths = self.troops * (malus_percent / 100.0);
+        let mut troops = self.troops;
+        if !self.remove_troops && self.source_tile.is_none() {
+            troops -= self.start_troops.unwrap_or(0.0);
+        }
+        let survivors = (troops - deaths).max(0.0);
+        if survivors >= 1.0 {
+            game.add_troops(self.owner_small_id, survivors);
+        }
+        // TS `stats().attackCancel(...)` only fires for genuine order-retreats
+        // (`Attack.retreated()`), not the auto-retreats used to end an attack
+        // that ran out of tiles/troops or hit a since-allied target.
+        if self.retreated {
+            game.adjust_attacks_sent(self.owner_small_id, -survivors);
+        }
+        self.troops = 0.0;
+        self.kill_attack(game);
+        self.active = false;
+    }
+
+    fn refresh_to_conquer(&mut self, game: &Game) {
+        self.to_conquer.clear();
+        self.border_tiles.clear();
+        if let Some(border) = game.border_tiles_of(self.owner_small_id) {
+            let tick = game.ticks();
+            for tile in border.iter() {
+                self.add_neighbors(game, tile, tick);
+            }
+        }
+    }
+
+    fn add_border_tile(&mut self, tile: TileRef) {
+        self.border_tiles.insert(tile);
+    }
+
+    fn remove_border_tile(&mut self, tile: TileRef) {
+        self.border_tiles.remove(tile);
+    }
+
+    fn handle_dead_defender(&mut self, game: &mut Game) {
+        if !self.target_is_player {
+            return;
+        }
+        let Some(defender) = game.player_by_small_id(self.target_small_id) else {
+            return;
+        };
+        if defender.tiles_owned >= 100 {
+            return;
+        }
+        let target_small = self.target_small_id;
+        let owner_small = self.owner_small_id;
+
+        game.conquer_player(owner_small, target_small);
+
+        for _ in 0..10 {
+            let tiles: Vec<TileRef> = game
+                .player_by_small_id(target_small)
+                .map(|p| p.owned_tiles.clone())
+                .unwrap_or_default();
+            for tile in tiles {
+                let mut neighbors = [TileRef::MAX; 4];
+                let mut n = 0usize;
+                game.map.for_each_neighbor4(tile, |nb| {
+                    if n < 4 {
+                        neighbors[n] = nb;
+                        n += 1;
+                    }
+                });
+                let mut borders_owner = false;
+                for i in 0..n {
+                    if game.map.owner_id(neighbors[i]) == owner_small {
+                        borders_owner = true;
+                        break;
+                    }
+                }
+                if borders_owner {
+                    game.conquer(owner_small, tile);
+                    continue;
+                }
+                let mut captured = false;
+                for i in 0..n {
+                    if captured {
+                        break;
+                    }
+                    let oid = game.map.owner_id(neighbors[i]);
+                    if oid == 0 || oid == target_small {
+                        continue;
+                    }
+                    if game.is_friendly(oid, target_small) {
+                        continue;
+                    }
+                    game.conquer(oid, tile);
+                    captured = true;
+                }
+            }
+        }
+    }
+
+    fn add_neighbors(&mut self, game: &Game, tile: TileRef, tick: u32) {
+        game.map.for_each_neighbor4(tile, |neighbor| {
+            if game.map.is_water(neighbor) {
+                return;
+            }
+            // Tip `AttackExecution.addNeighbors`: water or wrong owner skip
+            // (impassable filter removed on tip).
+            if game.map.owner_id(neighbor) != self.target_small_id {
+                return;
+            }
+
+            self.add_border_tile(neighbor);
+
+            let mut num_owned_by_me = 0u32;
+            game.map.for_each_neighbor4(neighbor, |inner| {
+                if game.map.owner_id(inner) == self.owner_small_id {
+                    num_owned_by_me += 1;
+                }
+            });
+
+            let mag = match game.terrain_type(neighbor) {
+                TerrainType::Plains => 1.0,
+                TerrainType::Highland => 1.5,
+                TerrainType::Mountain => 2.0,
+                _ => 0.0,
+            };
+
+            let priority = {
+                let p = (self.random.next_int(0, 7) as f64 + 10.0)
+                    * (1.0 - num_owned_by_me as f64 * 0.5 + mag as f64 / 2.0)
+                    + tick as f64;
+                p as f32
+            };
+            self.to_conquer.enqueue(neighbor, priority);
+        });
+    }
+}

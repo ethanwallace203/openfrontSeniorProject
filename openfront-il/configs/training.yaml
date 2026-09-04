@@ -1,0 +1,26 @@
+# Consumed by src/openfront_il/training/config.py. No hardcoded
+# hyperparameters belong in training/ code — see training/README.md.
+
+learning_rate: 0.001
+batch_size: 64
+epochs: 10
+seed: 1337
+checkpoint_dir: checkpoints
+
+# Stop after this many epochs with no validation-loss improvement.
+early_stopping_patience: 3
+
+# Per-head loss weights (see docs/imitation_learning_plan.md Section 2).
+action_type_loss_weight: 1.0
+unit_type_loss_weight: 1.0
+
+# Downweights the "noop" class in the action_type head's cross-entropy —
+# see docs/imitation_learning_plan.md Section 3 for why (noop is expected
+# to dominate the raw distribution by a wide margin). 1.0 = no downweight;
+# revisit once real class frequencies are measured.
+noop_downweight: 1.0
+
+# Game-level split fractions (docs/imitation_learning_plan.md Section 4).
+# The remainder after val+test is train.
+val_fraction: 0.1
+test_fraction: 0.1

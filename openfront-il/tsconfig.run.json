@@ -1,0 +1,21 @@
+{
+  "//": "Used only as `tsx --tsconfig tsconfig.run.json <script>` for actually EXECUTING engine/bridge scripts — never for type-checking (see tsconfig.json for that, and engine/bridge/README.md's 'A tsc --noEmit -p .' note for why the two are split).",
+  "//1": "tsx only applies a tsconfig's compilerOptions (target, useDefineForClassFields, etc.) to files matched by that config's `include` — files it resolves outside that scope silently fall back to esbuild's own defaults. tsconfig.json scopes `include` to engine/bridge/src so ESLint/tsc treat engine/openfront-ai as third-party code to skip; but that same scoping means tsx would compile the vendored engine's own files (transitively imported, never listed in `include`) with esbuild's defaults instead of our settings. Several engine classes (e.g. NationNukeBehavior) initialize instance fields by calling methods that read constructor-parameter-assigned properties, and esbuild's default (native ES2022+ class-field semantics) initializes those fields BEFORE the constructor body runs — including before TypeScript's parameter-property assignments — so the read sees undefined. This file has no `include`/`exclude` so tsx applies target/useDefineForClassFields to every file it compiles, vendored or not, matching engine/openfront-ai/openfront/tsconfig.json's own settings and restoring the field-initialization order those classes were authored for.",
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "useDefineForClassFields": false,
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "resources/*": ["./engine/openfront-ai/openfront/resources/*"],
+      "src/*": ["./engine/openfront-ai/openfront/src/*"]
+    }
+  }
+}

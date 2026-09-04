@@ -1,0 +1,72 @@
+[project]
+name = "openfront-il"
+version = "0.1.0"
+description = "Imitation-learning (behavior cloning) prototype for OpenFront.io"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "pydantic>=2.6",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=15.0",
+    "torch>=2.2",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.1",
+    "ruff>=0.3",
+    "mypy>=1.9",
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "types-PyYAML",
+    "pandas-stubs",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/openfront_il"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "N"]
+
+[tool.ruff.lint.per-file-ignores]
+# Deliberate: these files mirror an external camelCase schema (the raw
+# OpenFront API / engine/bridge/src/types.ts) field-for-field so they stay
+# a straightforward visual diff against their source of truth.
+"src/openfront_il/ingestion/api_contract.py" = ["N815"]
+"src/openfront_il/replay/snapshot_schema.py" = ["N815"]
+
+[tool.mypy]
+# 3.12, not the 3.11 floor in requires-python: numpy's own bundled stubs
+# use 3.12+ typing syntax that mypy can't parse under an older target.
+# This doesn't relax runtime compatibility — it only changes which stdlib
+# stub surface mypy assumes, not what syntax this project's own code uses.
+python_version = "3.12"
+strict = true
+packages = ["openfront_il"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["pyarrow.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: integration tests that run a small end-to-end fixture pipeline",
+]

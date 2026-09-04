@@ -1,0 +1,35 @@
+import {
+  buildNukeTrajectory,
+  computeNukeControlPoints,
+  computeTrajectoryThresholds,
+} from "../src/client/render/gl/utils/NukeTrajectory";
+
+// A large map height so the parabola arc isn't clamped.
+const MAP_H = 1000;
+
+// Helper: build control points for a straight horizontal trajectory.
+function horizontalCp(srcX: number, dstX: number) {
+  return computeNukeControlPoints(srcX, 500, dstX, 500, MAP_H, true);
+}
+
+describe("NukeTrajectory thresholds", () => {
+  test("tSamIntercept is 1.0 when no SAMs", () => {
+    const cp = horizontalCp(100, 800);
+    const th = computeTrajectoryThresholds(cp, 100, 500, 800, 500, []);
+    expect(th.tSamIntercept).toBe(1.0);
+  });
+
+  test("long trajectory has an untargetable mid-air zone", () => {
+    const cp = horizontalCp(100, 800);
+    const th = computeTrajectoryThresholds(cp, 100, 500, 800, 500, []);
+    expect(th.tUntargetableStart).toBeGreaterThanOrEqual(0);
+    expect(th.tUntargetableEnd).toBeGreaterThan(th.tUntargetableStart);
+  });
+
+  test("buildNukeTrajectory combines control points and thresholds", () => {
+    const data = buildNukeTrajectory(100, 500, 800, 500, MAP_H, true, []);
+    expect(data.tSamIntercept).toBe(1.0);
+    expect(data.p0x).toBe(100);
+    expect(data.p3x).toBe(800);
+  });
+});

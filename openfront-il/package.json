@@ -1,0 +1,34 @@
+{
+  "name": "openfront-il-engine-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node-side engine bridge: fetch, replay, and snapshot real OpenFront.io games for the Python imitation-learning pipeline.",
+  "type": "module",
+  "scripts": {
+    "fetch": "tsx --tsconfig tsconfig.run.json engine/bridge/src/fetchGame.ts",
+    "replay": "tsx --tsconfig tsconfig.run.json engine/bridge/src/replayGame.ts",
+    "lint": "eslint engine/bridge/src engine/bridge/tests",
+    "format": "prettier --write engine/bridge",
+    "test": "vitest run engine/bridge/tests"
+  },
+  "dependencies": {
+    "colord": "^2.9.3",
+    "dompurify": "^3.4.11",
+    "intl-messageformat": "^11.2.3",
+    "jose": "^6.2.3",
+    "lit": "^3.3.2",
+    "nanoid": "^5.1.11",
+    "tsx": "^4.7.0",
+    "yaml": "^2.4.0",
+    "zod": "^4.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5",
+    "typescript": "^5.4.0",
+    "vitest": "^1.4.0"
+  }
+}

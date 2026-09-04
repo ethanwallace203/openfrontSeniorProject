@@ -1,0 +1,3 @@
+[submodule "engine/openfront-ai"]
+	path = engine/openfront-ai
+	url = https://github.com/djmango/openfront-ai

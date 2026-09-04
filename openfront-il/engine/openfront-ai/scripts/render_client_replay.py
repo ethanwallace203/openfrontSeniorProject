@@ -1,0 +1,987 @@
+"""Render a GameRecord as a video of the REAL OpenFront client - actual
+game graphics: terrain art, units, factories, nukes, leaderboard, the lot.
+
+Drives a headless Chromium (Playwright) against the local dev client,
+replaying the record served by the archive-API shim. Client hooks (patch in
+patches/client-replay-tooling.patch, applied in a detached worktree at the
+record's engine commit so the openfront submodule stays clean):
+  - replayViewAs: the viewer adopts the agent's identity - self-player
+    styling, gold spawn ring, crown when first, "You Won!" modal
+  - replayFitMap: whole-map camera for showcase clips
+  - Full-episode capture by default (GPU preferred; SoftGL is slow but complete).
+  - RlDebugOverlay: in-client model panel (chosen action, value,
+    action-probability bars, recent-actions log) synced to the sim tick,
+    plus a red ✕ on the map when the decision includes a tile target;
+    it fetches <apiHost>/debug/<gameID>, which the shim serves from the
+    rl.watch debug sidecar (<record>.debug.json)
+
+The same overlay works in a normal browser (manual `ofshowcase archive`
+workflow) and in live games against webbot / rl.play --debug-port
+(localStorage rlDebugHost).
+
+Usage:
+  uv run python scripts/render_client_replay.py \
+      --record replays/v3_stage0.json --out replays/v3_client.webm
+
+Requires: `uv run playwright install chromium` (one-time) and a built
+`ofshowcase` (`cargo build --release -p ofhub`). Starts `ofshowcase
+archive` itself; starts the vite client too unless one is already on
+--client-port.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def ofshowcase_bin() -> Path:
+    env = os.environ.get("OFSHOWCASE")
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return p
+    for candidate in (
+        REPO / "rust/target/release/ofshowcase",
+        REPO / "rust/target/debug/ofshowcase",
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    which = shutil.which("ofshowcase")
+    if which:
+        return Path(which)
+    raise FileNotFoundError(
+        "ofshowcase not found; build with: cargo build --release -p ofhub "
+        "(or set OFSHOWCASE=/path/to/ofshowcase)"
+    )
+
+
+def port_open(port: int) -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def free_port(preferred: int | None = None) -> int:
+    """Return `preferred` when free, otherwise an ephemeral localhost port."""
+    if preferred is not None and not port_open(preferred):
+        return preferred
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def wait_http(url: str, timeout: float) -> None:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return
+        except Exception:
+            time.sleep(1.0)
+    raise SystemExit(f"timed out waiting for {url}")
+
+
+PATCH = REPO / "patches/client-replay-tooling.patch"
+SOFTGL_PATCH = REPO / "patches/showcase-allow-software-gl.patch"
+OPENFRONT = REPO / "openfront"
+
+
+def record_engine_commit(record: Path) -> str:
+    """Engine commit the record ran on; fall back to the submodule pin."""
+    override = os.environ.get("OF_CLIENT_COMMIT", "").strip()
+    if override:
+        return override
+    data = json.loads(record.read_text())
+    commit = data.get("gitCommit") or data.get("info", {}).get("gitCommit")
+    if commit and commit != "DEV":
+        return commit
+    return subprocess.check_output(
+        ["git", "-C", str(OPENFRONT), "rev-parse", "HEAD"], text=True,
+    ).strip()
+
+
+def linux_has_gpu() -> bool:
+    """True when Chromium can likely use a real GPU (NVIDIA / DRM) instead of SoftGL."""
+    if os.environ.get("OF_FORCE_SWIFTSHADER", "").strip() in ("1", "true", "yes"):
+        return False
+    if os.environ.get("OF_FORCE_GPU", "").strip() in ("1", "true", "yes"):
+        return True
+    # NVIDIA CDI / classic device nodes. RunPod often exposes nvidia1+ /
+    # renderD129+ without the *0 / *128 nodes.
+    for path in (
+        "/dev/nvidia0",
+        "/dev/nvidia1",
+        "/dev/dri/renderD128",
+        "/dev/dri/renderD129",
+        "/dev/dri/card0",
+    ):
+        if Path(path).exists():
+            return True
+    try:
+        if any(Path("/dev").glob("nvidia[0-9]*")):
+            return True
+        if any(Path("/dev/dri").glob("renderD*")):
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def chromium_args(*, soft_gl: bool | None = None) -> list[str]:
+    """Chromium flags for OpenFront WebGL.
+
+    Prefer a real GPU on Linux (homelab/showcase with NVIDIA). SoftGL/SwiftShader
+    is known to crawl at ~1fps and produces near-static hero clips - keep it as
+    fallback only. chrome-headless-shell silently SoftGLs even with NVIDIA
+    present; the GPU path uses full Chromium + Xvfb + ANGLE/Vulkan instead.
+    """
+    base = ["--no-sandbox", "--disable-dev-shm-usage", "--ignore-gpu-blocklist", "--enable-gpu"]
+    if platform.system() == "Darwin":
+        return base + ["--use-angle=metal"]
+    use_soft = soft_gl if soft_gl is not None else not linux_has_gpu()
+    if use_soft:
+        return base + [
+            "--use-gl=angle",
+            "--use-angle=swiftshader-webgl",
+            "--enable-unsafe-swiftshader",
+        ]
+    # Full Chromium + ANGLE/Vulkan (+ Xvfb) hits NVIDIA; do NOT enable
+    # --enable-unsafe-swiftshader here or Chromium quietly SoftGLs.
+    return base + [
+        "--use-angle=vulkan",
+        "--enable-features=Vulkan",
+        "--disable-vulkan-surface",
+        "--enable-gpu-rasterization",
+        "--in-process-gpu",
+    ]
+
+
+def ensure_xvfb_display() -> str | None:
+    """Start Xvfb if needed so headed Chromium can use NVIDIA GL/Vulkan."""
+    if platform.system() != "Linux":
+        return None
+    display = os.environ.get("DISPLAY", "").strip()
+    if display:
+        return display
+    display = os.environ.get("OF_XVFB_DISPLAY", ":99")
+    if shutil.which("Xvfb") is None:
+        print("Xvfb missing; NVIDIA WebGL may fall back to SoftGL")
+        return None
+    log = Path(tempfile.gettempdir()) / "of-xvfb.log"
+    subprocess.Popen(
+        ["Xvfb", display, "-screen", "0", "1920x1080x24"],
+        stdout=open(log, "ab"),
+        stderr=subprocess.STDOUT,
+    )
+    time.sleep(0.5)
+    os.environ["DISPLAY"] = display
+    print(f"started Xvfb on DISPLAY={display}")
+    return display
+
+
+def full_chromium_executable(pw) -> str | None:
+    """Path to full Chromium (not headless-shell) for real GPU WebGL."""
+    override = os.environ.get("OF_CHROMIUM_EXECUTABLE", "").strip()
+    if override and Path(override).is_file():
+        return override
+    try:
+        exe = Path(pw.chromium.executable_path)
+        for cand in (
+            exe.parent.parent.parent / "chromium-1228" / "chrome-linux64" / "chrome",
+            exe.parent / "chrome",
+        ):
+            if cand.is_file():
+                return str(cand)
+        cache = Path.home() / ".cache" / "ms-playwright"
+        matches = sorted(cache.glob("chromium-*/chrome-linux64/chrome"))
+        if matches:
+            return str(matches[-1])
+    except Exception:
+        pass
+    return None
+
+
+def configure_nvidia_gpu_env() -> None:
+    """Point Chromium at the host NVIDIA Vulkan/GLX stack."""
+    icd_candidates = (
+        os.environ.get("VK_ICD_FILENAMES", "").strip(),
+        "/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json",
+        "/usr/share/vulkan/icd.d/nvidia_icd.json",
+        "/etc/vulkan/icd.d/nvidia_icd.json",
+    )
+    for icd in icd_candidates:
+        if icd and Path(icd.split(":")[0]).is_file():
+            os.environ["VK_ICD_FILENAMES"] = icd
+            break
+    os.environ.setdefault("__NV_PRIME_RENDER_OFFLOAD", "1")
+    os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
+    # CDI / toolkit mounts often live under /usr/local/nvidia.
+    extra_libs = [
+        "/usr/local/nvidia/lib64",
+        "/usr/local/nvidia/lib",
+        "/run/opengl-driver/lib",
+    ]
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in extra_libs if Path(p).is_dir()]
+    if existing:
+        parts.append(existing)
+    if parts:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+
+
+def soft_gl_defaults(*, width: int, height: int, device_scale_factor: float) -> tuple[int, int, float]:
+    """Cheaper SoftGL capture so wall-clock clips still show gameplay motion."""
+    return (
+        min(width, 1280),
+        min(height, 720),
+        min(device_scale_factor, 1.0),
+    )
+
+
+def trim_video(
+    src: Path,
+    dst: Path,
+    start_sec: float,
+    max_duration: float | None,
+    *,
+    crf: int = 18,
+    speedup: float = 1.0,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        if src != dst:
+            shutil.move(src, dst)
+        return
+
+    cmd = [ffmpeg, "-y"]
+    if start_sec > 0.05:
+        cmd.extend(["-ss", f"{start_sec:.3f}"])
+    cmd.extend(["-i", str(src)])
+    vf_parts: list[str] = []
+    if speedup > 1.01:
+        # SoftGL records wall-clock at ~1fps; pack more sim progress into the clip.
+        vf_parts.append(f"setpts=PTS/{speedup:.4f}")
+    # Playwright records at 25fps. Normalize published clips to 30fps so
+    # browser playback is smooth and consistent after timestamp compression.
+    vf_parts.append("fps=30")
+    if vf_parts:
+        cmd.extend(["-vf", ",".join(vf_parts)])
+    if max_duration and max_duration > 0:
+        cmd.extend(["-t", f"{max_duration:.3f}"])
+    cmd.extend([
+        "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", str(crf),
+        "-row-mt", "1", "-an", str(dst),
+    ])
+    subprocess.run(cmd, check=True, capture_output=True)
+    if src != dst and src.exists():
+        src.unlink()
+
+
+@contextlib.contextmanager
+def client_worktree(commit: str):
+    """Detached openfront worktree at `commit` with replay-tooling patch applied."""
+    wt = Path(tempfile.mkdtemp(prefix="openfront-client-"))
+    try:
+        subprocess.run(
+            ["git", "-C", str(OPENFRONT), "worktree", "add", "--detach", str(wt), commit],
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "apply", str(PATCH)], cwd=wt, check=True,
+        )
+        # SoftGL/SwiftShader must be allowed for headless clip captures on
+        # GPU-less pods; without this the WebGL gate modal blocks replay.
+        if SOFTGL_PATCH.is_file():
+            subprocess.run(
+                ["git", "apply", str(SOFTGL_PATCH)], cwd=wt, check=True,
+            )
+        pin_nm = OPENFRONT / "node_modules"
+        if pin_nm.is_dir() and not (wt / "node_modules").exists():
+            os.symlink(pin_nm, wt / "node_modules")
+        print(f"client worktree {commit[:12]} at {wt}")
+        yield wt
+    finally:
+        subprocess.run(
+            ["git", "-C", str(OPENFRONT), "worktree", "remove", "--force", str(wt)],
+            capture_output=True,
+        )
+        shutil.rmtree(wt, ignore_errors=True)
+
+
+def load_episode_meta(record: Path) -> dict:
+    """Outcome + end tick from oftrain --watch debug sidecar (fallback: record info)."""
+    sidecar = record.with_suffix(".debug.json")
+    meta = {"outcome": "timeout", "end_tick": None}
+    if sidecar.exists():
+        data = json.loads(sidecar.read_text())
+        # Prefer explicit sidecar outcome; never invent "death" for truncations.
+        meta["outcome"] = data.get("outcome", "timeout")
+        meta["end_tick"] = data.get("end_tick")
+    if meta["end_tick"] is None:
+        info = json.loads(record.read_text()).get("info", {})
+        meta["end_tick"] = info.get("num_turns")
+    return meta
+
+
+def _client_game_map_values() -> dict[str, str]:
+    """Map Rust/engine map ids → OpenFront `GameMapType` string values.
+
+    Zod uses the enum *values* (often spaced display names), e.g.
+    `NorthAmerica = "North America"`. Native GameRecords often write the
+    PascalCase id; that fails schema validation and the replay button never
+    appears. Europe/World/Onion work only because id == value.
+    """
+    maps_gen = REPO / "openfront/src/core/game/Maps.gen.ts"
+    if not maps_gen.is_file():
+        # Detached client worktrees still have Maps.gen.ts; fall back empty.
+        return {}
+    text = maps_gen.read_text(encoding="utf-8")
+    # `export enum GameMapType { Name = "Value", ... }`
+    m = re.search(r"export enum GameMapType \{([^}]*)\}", text, re.S)
+    if not m:
+        return {}
+    return {
+        name: value
+        for name, value in re.findall(
+            r'([A-Za-z0-9_]+)\s*=\s*"([^"]*)"', m.group(1)
+        )
+    }
+
+
+def sanitize_record_for_client(record: Path, dest_dir: Path) -> Path:
+    """Copy a GameRecord so the OpenFront client Zod schema accepts it.
+
+    - `info.winner: null` fails WinnerSchema (optional, not nullable) → drop it.
+    - `info.gameID` must match `/^[A-Za-z0-9]{8}$/` or `/game/<id>` never joins.
+    - `info.config.gameMap` must be a `GameMapType` *value* (display string),
+      not necessarily the PascalCase id Rust writes.
+    """
+    data = json.loads(record.read_text())
+    info = data.setdefault("info", {})
+    changed = False
+    if "winner" in info and info["winner"] is None:
+        del info["winner"]
+        changed = True
+    cfg = info.get("config")
+    if isinstance(cfg, dict):
+        gm = cfg.get("gameMap")
+        if isinstance(gm, str):
+            mapping = _client_game_map_values()
+            # Prefer id→value; also accept already-correct values.
+            values = set(mapping.values())
+            if gm in mapping and mapping[gm] != gm:
+                cfg["gameMap"] = mapping[gm]
+                changed = True
+                print(f"rewrote gameMap {gm!r} -> {mapping[gm]!r} for client Zod")
+            elif gm not in values and gm not in mapping:
+                print(
+                    f"WARNING: gameMap {gm!r} not in GameMapType; "
+                    "client may reject the record"
+                )
+        # Native stage-0 writes nations=0; GameConfigSchema is min(1) or
+        # "default"/"disabled". Zero fails Zod and the replay button never
+        # appears (JoinLobbyModal treats it as version_mismatch).
+        nations = cfg.get("nations")
+        if isinstance(nations, int) and nations < 1:
+            cfg["nations"] = "disabled"
+            changed = True
+            print(f"rewrote nations {nations} -> 'disabled' for client Zod")
+    gid = info.get("gameID")
+    if not isinstance(gid, str) or not (
+        len(gid) == 8 and gid.isalnum()
+    ):
+        # Stable 8-char id from path so parallel renders don't collide.
+        digest = hashlib.sha1(str(record.resolve()).encode()).hexdigest()[:8]
+        info["gameID"] = digest
+        changed = True
+        print(f"rewrote gameID {gid!r} -> {digest} for client GAME_ID_REGEX")
+    if not changed:
+        return record
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out = dest_dir / record.name
+    out.write_text(json.dumps(data, separators=(",", ":")))
+    # Keep debug/thinking sidecars discoverable next to the sanitized record.
+    for suffix in (".debug.json", ".thinking.json"):
+        side = record.with_name(record.stem + suffix)
+        if side.is_file():
+            target = out.with_name(out.stem + suffix)
+            if not target.exists():
+                try:
+                    os.symlink(side.resolve(), target)
+                except OSError:
+                    shutil.copy2(side, target)
+    return out
+
+
+def render_record(
+    record: Path,
+    out: Path,
+    *,
+    speed: str = "max",
+    width: int = 1920,
+    height: int = 1080,
+    device_scale_factor: float = 2,
+    crf: int = 18,
+    timeout: int = 1200,
+    api_port: int = 8987,
+    client_port: int = 9000,
+    headed: bool = False,
+    overlay: bool = True,
+    reuse_services: bool = False,
+    trim_gameplay: bool = False,
+    max_duration: int | None = None,
+    death_trim_ticks: int = 55,
+    win_hold_sec: float = 2.5,
+    full_game: bool = True,
+) -> None:
+    _ = full_game  # always-on; kept for call-site compat
+    from playwright.sync_api import sync_playwright
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sanitize_dir = out.parent / ".client-render-records"
+    record = sanitize_record_for_client(record, sanitize_dir)
+    game_id = json.loads(record.read_text())["info"]["gameID"]
+    print(f"gameID {game_id} -> {out}")
+
+    sidecar = record.with_name(record.stem + ".debug.json")
+    if not sidecar.exists():
+        sidecar = record.with_suffix(".debug.json")
+    episode = load_episode_meta(record)
+    print(f"episode outcome: {episode['outcome']} (end tick {episode['end_tick']})")
+    if overlay and sidecar.exists():
+        print(f"model overlay from {sidecar.name}")
+    elif overlay:
+        print(f"no {sidecar.name} - rendering without the model overlay")
+
+    if reuse_services and port_open(api_port):
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{api_port}/game/{game_id}", timeout=2
+            )
+        except Exception:
+            print(
+                f"reuse-services archive :{api_port} missing game {game_id}; "
+                "falling back to self-contained SoftGL"
+            )
+            reuse_services = False
+
+    procs: list[subprocess.Popen] = []
+    # Self-contained SoftGL must not collide with a leftover showcase archive
+    # or vite on the default ports - that looks like a replay-button timeout
+    # because Chromium talks to the wrong (empty) archive.
+    if not reuse_services:
+        if port_open(api_port):
+            api_port = free_port()
+            print(f"archive port busy; self-contained render using :{api_port}")
+        if port_open(client_port):
+            client_port = free_port()
+            print(f"client port busy; self-contained render using :{client_port}")
+
+    client_ctx = (
+        contextlib.nullcontext(OPENFRONT)
+        if reuse_services
+        else client_worktree(record_engine_commit(record))
+    )
+
+    want_gpu = linux_has_gpu()
+    refuse_soft = os.environ.get("OF_REFUSE_SOFTGL", "1").strip().lower() not in (
+        "0", "false", "no",
+    )
+    use_soft_gl = platform.system() != "Darwin" and not want_gpu
+    if want_gpu and refuse_soft:
+        use_soft_gl = False
+    chrome_args = chromium_args(soft_gl=use_soft_gl)
+    render_width, render_height, render_dpr = width, height, device_scale_factor
+    if use_soft_gl:
+        render_width, render_height, render_dpr = soft_gl_defaults(
+            width=width, height=height, device_scale_factor=device_scale_factor
+        )
+        print(
+            f"SoftGL fallback: {render_width}x{render_height} dpr={render_dpr} "
+            "(mount /dev/nvidia* or set OF_FORCE_GPU=1 for real WebGL)"
+        )
+    else:
+        print(f"Chromium WebGL: GPU path ({' '.join(chrome_args[-4:])})")
+
+    with client_ctx as client_dir:
+        try:
+            if not reuse_services or not port_open(api_port):
+                procs.append(subprocess.Popen(
+                    [
+                        str(ofshowcase_bin()),
+                        "archive",
+                        "--records",
+                        str(record.parent),
+                        "--port",
+                        str(api_port),
+                        "--bind",
+                        "127.0.0.1",
+                    ],
+                    cwd=REPO,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ))
+            if not reuse_services or not port_open(client_port):
+                print(
+                    f"starting vite client on :{client_port} "
+                    "(first boot takes ~15s)..."
+                )
+                # Headless pods have no xdg-open; vite's `open: true` otherwise
+                # crashes the process after bind and the replay never loads.
+                client_env = os.environ.copy()
+                client_env["BROWSER"] = "none"
+                client_env["SKIP_BROWSER_OPEN"] = "true"
+                procs.append(subprocess.Popen(
+                    [
+                        "npm",
+                        "run",
+                        "start:client",
+                        "--",
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(client_port),
+                        "--strictPort",
+                    ],
+                    cwd=client_dir,
+                    env=client_env,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                ))
+            wait_http(f"http://localhost:{client_port}", 90)
+
+            speed_label = {"0.5": "×0.5", "1": "×1", "2": "×2"}.get(speed)
+
+            with sync_playwright() as pw, tempfile.TemporaryDirectory() as td:
+                launch_kwargs: dict = {"args": chrome_args}
+                if want_gpu and platform.system() == "Linux":
+                    # chrome-headless-shell → SwiftShader even with GPUs present.
+                    # Headed full Chromium under Xvfb + ANGLE/Vulkan → NVIDIA.
+                    ensure_xvfb_display()
+                    configure_nvidia_gpu_env()
+                    full = full_chromium_executable(pw)
+                    if full:
+                        launch_kwargs["executable_path"] = full
+                        launch_kwargs["headless"] = False
+                        print(f"using full Chromium for NVIDIA WebGL: {full}")
+                    else:
+                        launch_kwargs["headless"] = not headed
+                        print(
+                            "full Chromium not found; "
+                            "headless-shell may SoftGL-fallback"
+                        )
+                    launch_kwargs["env"] = dict(os.environ)
+                else:
+                    launch_kwargs["headless"] = not headed
+                browser = pw.chromium.launch(**launch_kwargs)
+                ctx = browser.new_context(
+                    viewport={"width": render_width, "height": render_height},
+                    device_scale_factor=render_dpr,
+                    record_video_dir=td,
+                    record_video_size={"width": render_width, "height": render_height},
+                )
+                overlay_flag = "1" if overlay else "0"
+                end_tick = episode.get("end_tick")
+                outcome = episode.get("outcome", "timeout")
+                # Always record the full episode. SoftGL is slow; prefer a GPU.
+                # CLIP_RENDER_EVERY can thin draws on SoftGL without skipping ticks.
+                render_every = os.environ.get("CLIP_RENDER_EVERY") or (
+                    "40" if use_soft_gl else "1"
+                )
+                # Allow SoftGL only when we intentionally chose that path;
+                # refuse it when a real GPU was requested (OF_REFUSE_SOFTGL=1).
+                allow_sw = "1" if use_soft_gl else "0"
+                ctx.add_init_script(
+                    f'localStorage.setItem("apiHost", "http://127.0.0.1:{api_port}");'
+                    'localStorage.setItem("replayViewAs", "1");'
+                    'localStorage.setItem("replayFitMap", "1");'
+                    f'localStorage.setItem("rlDebugOverlay", "{overlay_flag}");'
+                    f'localStorage.setItem("rlAllowSoftwareGL", "{allow_sw}");'
+                    f'localStorage.setItem("replayRenderEvery", "{render_every}");'
+                    'localStorage.setItem("settings.goToPlayer", "false");'
+                    # Solid fills at whole-map zoom (patterns read as "dots").
+                    'localStorage.setItem("settings.territoryPatterns", "false");'
+                    'localStorage.setItem("username", "AGENT");'
+                    'localStorage.setItem("replaySkipVisualUntil", "0");'
+                )
+                page = ctx.new_page()
+                page_open_t0 = time.time()
+                gl_info = page.evaluate(
+                    """() => {
+                      const c = document.createElement("canvas");
+                      const gl = c.getContext("webgl2") || c.getContext("webgl");
+                      if (!gl) return {ok: false};
+                      const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+                      return {
+                        ok: true,
+                        renderer: gl.getParameter(
+                          dbg ? dbg.UNMASKED_RENDERER_WEBGL : gl.RENDERER
+                        ),
+                      };
+                    }"""
+                )
+                renderer = str((gl_info or {}).get("renderer") or "")
+                print(f"WebGL renderer: {renderer or 'none'}")
+                soft = (
+                    "swiftshader" in renderer.lower()
+                    or "llvmpipe" in renderer.lower()
+                    or "softpipe" in renderer.lower()
+                )
+                if soft:
+                    if want_gpu and refuse_soft:
+                        raise SystemExit(
+                            f"refusing SoftGL fallback ({renderer!r}); "
+                            "need full Chromium + Xvfb + NVIDIA Vulkan "
+                            "(set OF_REFUSE_SOFTGL=0 to override)"
+                        )
+                    use_soft_gl = True
+                    print(
+                        "WARNING: Chromium fell back to SoftGL - full-game "
+                        "capture will crawl (~0.7 tick/s)."
+                    )
+                page.goto(
+                    f"http://localhost:{client_port}/game/{game_id}",
+                    wait_until="domcontentloaded",
+                    timeout=120_000,
+                )
+
+                toggle = page.locator('img[alt="replay"]')
+                toggle.wait_for(state="visible", timeout=120_000)
+                # DOM click: Playwright's real click hangs under SwiftShader when
+                # overlays/hit-testing stall ("performing click action" forever).
+                toggle.evaluate("el => el.click()")
+                panel = page.locator("replay-panel button").first
+                panel.wait_for(state="visible", timeout=30_000)
+                if speed_label:
+                    page.locator("replay-panel button", has_text=speed_label).evaluate(
+                        "el => el.click()"
+                    )
+                else:
+                    page.locator("replay-panel button").last.evaluate(
+                        "el => el.click()"
+                    )
+                page.wait_for_timeout(800)
+                target_tick_rate = float(
+                    os.environ.get("CLIP_GAME_TICKS_PER_SEC", "20")
+                )
+                mode = "SoftGL" if use_soft_gl else "GPU"
+                print(
+                    f"full-game {mode} capture "
+                    f"(end_tick={end_tick}, outcome={outcome})"
+                    + ("; wall-clock may be long on SoftGL" if use_soft_gl else "")
+                )
+
+                gameplay_t0 = time.time()
+                start_tick = page.evaluate(
+                    "() => (typeof window.__replayTick === 'number' "
+                    "? window.__replayTick : 0)"
+                )
+                last_tick = start_tick
+                print("replay running...")
+
+                # Death: cut before the wipeout modal. Timeout: cut at the
+                # episode budget - without this the loop runs to --timeout
+                # wall-clock because no win/death modal ever appears.
+                if end_tick and outcome == "death":
+                    stop_tick = int(end_tick) - death_trim_ticks
+                elif end_tick and outcome == "timeout":
+                    stop_tick = int(end_tick)
+                else:
+                    stop_tick = None
+                t0 = time.time()
+                gameplay_duration: float | None = None
+                win_hold_t0: float | None = None
+                early_modal_warned = False
+                while time.time() - t0 < timeout:
+                    if (
+                        max_duration is not None
+                        and time.time() - gameplay_t0 >= float(max_duration)
+                    ):
+                        gameplay_duration = time.time() - gameplay_t0
+                        print(
+                            f"max-duration {max_duration}s reached "
+                            f"(tick={page.evaluate('() => window.__replayTick ?? null')})"
+                        )
+                        break
+                    tick = page.evaluate(
+                        "() => (typeof window.__replayTick === 'number' "
+                        "? window.__replayTick : null)"
+                    )
+                    if tick is not None:
+                        last_tick = tick
+                    if (
+                        stop_tick is not None
+                        and tick is not None
+                        and tick >= stop_tick
+                    ):
+                        gameplay_duration = max(0.0, time.time() - gameplay_t0 - 0.2)
+                        why = "before death" if outcome == "death" else "at episode end"
+                        print(
+                            f"stopping {why} at tick {tick} "
+                            f"(trim to {gameplay_duration:.1f}s gameplay)"
+                        )
+                        break
+
+                    modal = page.locator("win-modal div.fixed")
+                    if modal.count() > 0:
+                        # Client replay must match the watch GameRecord (Node).
+                        # Never dismiss a conflicting terminal signal and keep
+                        # filming — that ships death footage labeled as a win.
+                        modal_text = ""
+                        try:
+                            modal_text = " ".join(
+                                (modal.inner_text(timeout=500) or "").split()
+                            )[:160]
+                        except Exception:
+                            modal_text = ""
+                        reached_end = end_tick is None or (
+                            tick is not None and tick >= int(end_tick)
+                        )
+                        text_l = modal_text.lower()
+                        client_death = "you died" in text_l or (
+                            "has won" in text_l and "you won" not in text_l
+                        )
+                        client_win = "you won" in text_l
+
+                        def _dismiss_early_modal(reason: str) -> None:
+                            nonlocal early_modal_warned
+                            if not early_modal_warned:
+                                early_modal_warned = True
+                                print(
+                                    f"{reason} at tick {tick} "
+                                    f"(recorded end_tick={end_tick}, "
+                                    f"modal={modal_text!r}) - dismissing overlay"
+                                )
+                            page.evaluate(
+                                """() => {
+                                  for (const el of document.querySelectorAll(
+                                    'win-modal div.fixed'
+                                  )) {
+                                    el.remove();
+                                  }
+                                  const wm = document.querySelector('win-modal');
+                                  if (wm) {
+                                    wm.style.display = 'none';
+                                    try { wm.hasShownDeathModal = true; } catch (_) {}
+                                  }
+                                }"""
+                            )
+
+                        def _fail_desync(why: str) -> None:
+                            raise SystemExit(
+                                f"client replay desync: {why} at tick "
+                                f"{tick}/{end_tick} (modal={modal_text!r}, "
+                                f"record outcome={outcome}). Refusing to ship "
+                                f"a mismatched clip."
+                            )
+
+                        if outcome == "win":
+                            if reached_end and client_win:
+                                if win_hold_t0 is None:
+                                    win_hold_t0 = time.time()
+                                    print(
+                                        f"win modal at tick {tick} - holding for celebration"
+                                        + (f" ({modal_text})" if modal_text else "")
+                                    )
+                                elif time.time() - win_hold_t0 >= win_hold_sec:
+                                    gameplay_duration = time.time() - gameplay_t0
+                                    break
+                            elif client_death or (reached_end and not client_win):
+                                _fail_desync(
+                                    "client death/other-win on watch-win record"
+                                    if client_death
+                                    else "no client You-Won modal at watch win tick"
+                                )
+                            else:
+                                # Spurious non-terminal overlay; clear and continue.
+                                _dismiss_early_modal("early non-terminal modal on win")
+                        elif outcome == "timeout":
+                            if client_death:
+                                _fail_desync(
+                                    "client death/other-win on watch-timeout "
+                                    "(agent still alive in watch record)"
+                                )
+                            _dismiss_early_modal("early modal on timeout")
+                        else:
+                            # death: if stop_tick missed, cut on modal near end
+                            near_death = stop_tick is None or (
+                                tick is not None and tick >= int(stop_tick)
+                            )
+                            if near_death:
+                                gameplay_duration = max(
+                                    0.0, time.time() - gameplay_t0 - 1.5
+                                )
+                                print(
+                                    f"death modal detected late "
+                                    f"(trim to {gameplay_duration:.1f}s gameplay)"
+                                    + (f" ({modal_text})" if modal_text else "")
+                                )
+                                break
+                            else:
+                                _dismiss_early_modal("early death modal")
+
+                    if (
+                        outcome == "win"
+                        and end_tick is not None
+                        and tick is not None
+                        and tick >= int(end_tick)
+                        and win_hold_t0 is None
+                    ):
+                        # Win tick reached; require the client You-Won modal.
+                        saw_win = False
+                        for _ in range(30):
+                            if modal.count() > 0:
+                                try:
+                                    mt = " ".join(
+                                        (modal.inner_text(timeout=500) or "").split()
+                                    ).lower()
+                                except Exception:
+                                    mt = ""
+                                if "you won" in mt:
+                                    saw_win = True
+                                    win_hold_t0 = time.time()
+                                    print(
+                                        f"win modal at tick {tick} - holding for celebration"
+                                    )
+                                    break
+                                raise SystemExit(
+                                    f"client replay desync: modal at watch win "
+                                    f"tick {tick}/{end_tick} is not You-Won "
+                                    f"(modal={mt!r}). Refusing to ship."
+                                )
+                            page.wait_for_timeout(100)
+                        if not saw_win and win_hold_t0 is None:
+                            raise SystemExit(
+                                f"client replay desync: end_tick {end_tick} "
+                                f"reached without You-Won modal on watch-win "
+                                f"record. Refusing to ship a mismatched clip."
+                            )
+
+                    page.wait_for_timeout(100)
+                else:
+                    print("timeout reached; saving what we have")
+
+                page.close()
+                video = page.video.path() if page.video else None
+                ctx.close()
+                browser.close()
+                if not video or not Path(video).exists():
+                    raise SystemExit("no video captured")
+
+                raw = Path(video)
+                trim_start = (gameplay_t0 - page_open_t0) if trim_gameplay else 0.0
+                if trim_gameplay:
+                    print(f"trimming {trim_start:.1f}s of load-in")
+                recorded = gameplay_duration if gameplay_duration is not None else (
+                    time.time() - gameplay_t0
+                )
+                ticks_rendered = max(0, int(last_tick or 0) - int(start_tick or 0))
+                tick_rate = ticks_rendered / recorded if recorded > 0 else 0.0
+                print(
+                    f"captured {ticks_rendered} ticks in {recorded:.1f}s "
+                    f"({tick_rate:.1f} ticks/sec before video speedup)"
+                )
+                # Compress wall-clock capture to target gameplay tick rate.
+                speedup = 1.0
+                if ticks_rendered > 0 and recorded > 0 and target_tick_rate > 0:
+                    desired = ticks_rendered / target_tick_rate
+                    if max_duration is not None:
+                        desired = min(desired, float(max_duration))
+                    if desired > 0:
+                        speedup = recorded / desired
+                        print(
+                            f"speedup {speedup:.1f}x "
+                            f"({recorded:.0f}s wall, {ticks_rendered} ticks "
+                            f"-> {desired:.1f}s at {target_tick_rate:g} ticks/sec)"
+                        )
+                    trim_end = desired
+                elif max_duration is not None:
+                    trim_end = min(recorded, float(max_duration))
+                else:
+                    trim_end = gameplay_duration
+                trim_video(
+                    raw,
+                    out,
+                    trim_start,
+                    trim_end,
+                    crf=crf,
+                    speedup=speedup,
+                )
+
+            print(f"wrote {out}")
+        finally:
+            for p in procs:
+                p.terminate()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--record", required=True, help="GameRecord JSON from oftrain --watch")
+    ap.add_argument("--out", default=None, help="output .webm (default: <record>.client.webm)")
+    ap.add_argument("--speed", default="max", choices=["0.5", "1", "2", "max"])
+    ap.add_argument("--width", type=int, default=1920)
+    ap.add_argument("--height", type=int, default=1080)
+    ap.add_argument("--device-scale-factor", type=float, default=2,
+                    help="emulate retina DPR so WebGL renders at 2x backing resolution")
+    ap.add_argument("--crf", type=int, default=18,
+                    help="VP9 quality for ffmpeg trim pass (lower = sharper, default 18)")
+    ap.add_argument("--timeout", type=int, default=1200, help="max seconds to wait for game end")
+    ap.add_argument("--api-port", type=int, default=8987)
+    ap.add_argument("--client-port", type=int, default=9000)
+    ap.add_argument("--headed", action="store_true", help="show the browser window")
+    ap.add_argument("--overlay", action=argparse.BooleanOptionalAction, default=True,
+                    help="model debug panel from <record>.debug.json (--no-overlay to disable)")
+    ap.add_argument("--reuse-services", action="store_true",
+                    help="use existing ofshowcase archive + vite on api/client ports")
+    ap.add_argument("--trim-gameplay", action="store_true",
+                    help="ffmpeg-trim load-in before replay starts")
+    ap.add_argument("--max-duration", type=int, default=0,
+                    help="cap output length in seconds (0 = full replay)")
+    ap.add_argument(
+        "--full-game",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="record the whole episode (default; --no-full-game is ignored legacy)",
+    )
+    args = ap.parse_args()
+
+    record = Path(args.record).resolve()
+    out = Path(args.out or record.with_suffix(".client.webm"))
+    max_duration = args.max_duration if args.max_duration > 0 else None
+    render_record(
+        record,
+        out,
+        speed=args.speed,
+        width=args.width,
+        height=args.height,
+        device_scale_factor=args.device_scale_factor,
+        crf=args.crf,
+        timeout=args.timeout,
+        api_port=args.api_port,
+        client_port=args.client_port,
+        headed=args.headed,
+        overlay=args.overlay,
+        reuse_services=args.reuse_services,
+        trim_gameplay=args.trim_gameplay,
+        max_duration=max_duration,
+        full_game=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

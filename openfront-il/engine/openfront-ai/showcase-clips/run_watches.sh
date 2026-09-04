@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Human-facing watch episodes: one stochastic native watch per lobby size,
+# train-matched tick budget, distinct non-Onion maps.
+# See .cursor/rules/showcase-clips.mdc.
+#
+# One watch → one record. No seed hunting. Render trusts native outcome
+# (scripts/render_client_replay.py dismisses early client modals).
+set -euo pipefail
+cd /workspace
+export PATH="/workspace/rust/.libtorch-venv/bin:$PATH"
+TORCH_ROOT="/workspace/rust/.libtorch-venv/lib/python3.11/site-packages"
+export LD_LIBRARY_PATH="${TORCH_ROOT}/torch/lib:${TORCH_ROOT}/nvidia/cu13/lib:${TORCH_ROOT}/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+mkdir -p showcase-clips /workspace/artifacts
+
+POLICY=rust/checkpoints/ppo_v11/latest.safetensors
+STATE=rust/checkpoints/ppo_v11/latest.state.json
+AE=weights/ae/ae_v32_nostatic_d8c32.encoder.safetensors
+COARSE=weights/ae/ae_v32_nostatic_d16c32.encoder.safetensors
+OFTRAIN=./rust/target/release/oftrain
+
+# Shared with train (ofcore::DEFAULT_MAX_EPISODE_TICKS / pod --max-episode-ticks).
+MAX_TICKS=21000
+MAX_STEPS=$((MAX_TICKS / 15 + 64))
+
+UPD=$(python3 -c "import json;print(json.load(open('$STATE'))['update'])")
+TAG_PREFIX="ppo_v11_u${UPD}"
+
+run_watch() {
+  local STAGE=$1 N=$2 BOTS=$3 TAG=$4 MAP=$5 SEED=$6
+  local OUT="showcase-clips/${TAG_PREFIX}_${TAG}.json"
+  local LOG="showcase-clips/${TAG_PREFIX}_${TAG}.watch.log"
+  echo "=== WATCH stage=$STAGE n=$N bots=$BOTS map=$MAP seed=$SEED ticks=$MAX_TICKS ($TAG) $(date -u +%H:%M:%S) ===" | tee "$LOG"
+  "$OFTRAIN" \
+    --watch \
+    --watch-stochastic=true \
+    --engine node \
+    --policy "$POLICY" \
+    --ckpt "$AE" \
+    --coarse-ckpt "$COARSE" \
+    --stage "$STAGE" \
+    --map "$MAP" \
+    --bots "$BOTS" \
+    --nations "$N" \
+    --difficulty Easy \
+    --seed "$SEED" \
+    --device cuda:0 \
+    --amp=true \
+    --foveate=true \
+    --persistent-actors=true \
+    --recurrent-policy=true \
+    --max-episode-ticks "$MAX_TICKS" \
+    --max-steps "$MAX_STEPS" \
+    --record "$OUT" \
+    --debug true \
+    >>"$LOG" 2>&1
+  echo "EXIT:$? wrote $OUT ($(date -u +%H:%M:%S))" | tee -a "$LOG"
+  python3 - <<PY | tee -a "$LOG"
+import json
+from pathlib import Path
+dbg=Path("showcase-clips/${TAG_PREFIX}_${TAG}.debug.json")
+d=json.loads(dbg.read_text()) if dbg.exists() else {}
+print(f"outcome={d.get('outcome')} end_tick={d.get('end_tick')} (train_budget={$MAX_TICKS})")
+if d.get("outcome") == "timeout":
+    assert int(d["end_tick"]) >= $MAX_TICKS, (d, "timeout before train budget")
+PY
+  tail -20 "$LOG"
+}
+
+echo "CHECKPOINT update=$UPD TRAIN_MATCHED max-episode-ticks=$MAX_TICKS max-steps=$MAX_STEPS"
+
+# Density-matched Easy lobbies (policy may still be earlier — OOD deaths are fine).
+run_watch 13 2 26 n2_europe Europe watch_n2
+run_watch 20 4 34 n4_world World watch_n4
+run_watch 26 8 66 n8_europe Europe watch_n8
+echo ALL_WATCHES_DONE
+ls -lh showcase-clips/${TAG_PREFIX}_n{2_europe,4_world,8_europe}.{json,debug.json} 2>/dev/null || true

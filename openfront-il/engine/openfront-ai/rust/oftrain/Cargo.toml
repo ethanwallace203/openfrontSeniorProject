@@ -1,0 +1,39 @@
+[package]
+name = "oftrain"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "oftrain"
+path = "src/main.rs"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+ofcore = { path = "../ofcore" }
+tch = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+clap = { version = "4", features = ["derive"] }
+rand = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"
+anyhow = "1"
+flate2 = "1"
+base64 = "0.22"
+crossbeam-channel = "0.5"
+libc = "0.2"
+# In-process native engine (same workspace since the rust-ofrs-fast merge).
+openfront-engine = { path = "../engine", optional = true }
+half = "2.7.1"
+
+[features]
+# native-engine is on by default: CLI `--engine native` is the production
+# path, and building without this feature recently took a live pod down.
+# Opt out with `--no-default-features` (Node-only / parity tooling).
+default = ["native-engine"]
+download-libtorch = ["tch/download-libtorch"]
+native-engine = ["dep:openfront-engine"]
+# Compiles the device-resident persistent-learner gradient reducer. Builds
+# without NCCL retain the CPU gradient hub with no runtime dependency.
+nccl = []
