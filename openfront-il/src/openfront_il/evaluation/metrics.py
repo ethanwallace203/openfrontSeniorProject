@@ -60,3 +60,22 @@ def legality_violation_rate(
         return 0.0
     is_illegal = ~legality_masks[np.arange(len(predictions)), predictions]
     return float(is_illegal.mean())
+
+
+def fraction_true(correct: NDArray[np.bool_]) -> float:
+    """Fraction of ``True`` entries — accuracy when the caller has already
+    compared predictions to labels (e.g. a masked argmax per example).
+    ``0.0`` for an empty input, as with ``accuracy``."""
+    if len(correct) == 0:
+        return 0.0
+    return float(correct.mean())
+
+
+def uniform_over_legal_baseline_accuracy(legal_counts: NDArray[np.int64]) -> float:
+    """Expected accuracy of picking uniformly at random among each
+    example's legal choices: ``mean(1 / legal_count)``. The trivial
+    baseline for a pointer head, whose number of choices varies per
+    example, so a most-common-class baseline doesn't apply."""
+    if len(legal_counts) == 0:
+        return 0.0
+    return float((1.0 / np.maximum(legal_counts, 1)).mean())

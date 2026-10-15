@@ -21,7 +21,10 @@ from pydantic import BaseModel
 from openfront_il.models.policy_network import PolicyNetwork
 from openfront_il.models.spatial_encoder import SpatialEncoder
 
-FORMAT_VERSION = 1
+# v2: SpatialEncoder returns its feature map alongside the pooled latent,
+# and PolicyNetwork gained the tile_target / target_player heads (plus
+# PolicyNetworkConfig.player_feature_dim). See docs/rl_handoff.md.
+FORMAT_VERSION = 2
 
 
 class SpatialEncoderConfig(BaseModel):
@@ -34,6 +37,7 @@ class PolicyNetworkConfig(BaseModel):
     flat_dim: int
     action_type_count: int
     unit_type_count: int
+    player_feature_dim: int
     hidden_dim: int = 128
 
 

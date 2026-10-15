@@ -43,7 +43,7 @@ it is the drift alarm, not a guarantee of byte-for-byte sync at all times.
 | File | Reads | Provides |
 |---|---|---|
 | `snapshot_schema.py` | — | `pydantic` models mirroring `types.ts`: `SnapshotHeader`, `TickSnapshot`, `PlayerScalars`, `UnitSnapshot`, `AttackSnapshot`, `AllianceSnapshot`, `LegalityMask`, `Winner` |
-| `loader.py` | `data/snapshots/{gameId}.jsonl` | `iter_snapshots(game_id)`, a streaming generator of validated `SnapshotHeader \| TickSnapshot` objects (one line read/validated at a time — real files run hundreds of MB to low GB), and `load_snapshots(game_id)`, a small-fixture/test convenience that loads a whole game into memory |
+| `loader.py` | `data/snapshots/{gameId}.jsonl` | `iter_snapshots(game_id)`, a streaming generator of validated `SnapshotHeader \| TickSnapshot` objects (one line read/validated at a time — real files run hundreds of MB to low GB), `load_snapshots(game_id)`, a small-fixture/test convenience that loads a whole game into memory, and random access for training: `index_snapshots(game_id)` -> `SnapshotIndex` (the header plus each tick line's byte range, from one scan) and `read_tick(file, offset, length)` to read back a single tick |
 
 ## Style
 

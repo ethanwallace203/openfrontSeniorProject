@@ -72,3 +72,20 @@ class TestLegalityViolationRate:
             np.array([], dtype=np.int64), np.zeros((0, 3), dtype=bool)
         )
         assert result == 0.0
+
+
+class TestFractionTrue:
+    def test_counts_true_entries(self) -> None:
+        assert metrics.fraction_true(np.array([True, False, True, True])) == 0.75
+
+    def test_empty_is_zero(self) -> None:
+        assert metrics.fraction_true(np.array([], dtype=bool)) == 0.0
+
+
+class TestUniformOverLegalBaselineAccuracy:
+    def test_is_mean_of_reciprocal_choice_counts(self) -> None:
+        # 1/1 and 1/4 -> 0.625
+        assert metrics.uniform_over_legal_baseline_accuracy(np.array([1, 4])) == 0.625
+
+    def test_empty_is_zero(self) -> None:
+        assert metrics.uniform_over_legal_baseline_accuracy(np.array([], dtype=np.int64)) == 0.0

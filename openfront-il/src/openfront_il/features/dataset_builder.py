@@ -27,7 +27,7 @@ import pyarrow.parquet as pq
 from openfront_il.features.action_encoder import encode_action, encode_legality_mask
 from openfront_il.features.observation_encoder import FLAT_FEATURES, encode_flat
 from openfront_il.replay import loader
-from openfront_il.replay.snapshot_schema import TickSnapshot
+from openfront_il.replay.snapshot_schema import SnapshotHeader, TickSnapshot
 from openfront_il.utils import paths
 from openfront_il.utils.logging import get_logger
 
@@ -35,12 +35,22 @@ logger = get_logger(__name__)
 
 
 def _small_id_by_client_id(tick: TickSnapshot) -> dict[str, int]:
+    """Who is acting: ``tick.legal`` and ``tick.actions`` are keyed by the
+    acting human's clientID."""
     return {
         player.clientID: player.smallID for player in tick.players if player.clientID is not None
     }
 
 
-def build_rows_for_tick(tick: TickSnapshot, *, game_id: str) -> list[dict[str, object]]:
+def _small_id_by_player_id(tick: TickSnapshot) -> dict[str, int]:
+    """Whom an intent targets: intent target fields hold engine PlayerIDs,
+    which every player (human, nation, tribe) has."""
+    return {player.id: player.smallID for player in tick.players}
+
+
+def build_rows_for_tick(
+    tick: TickSnapshot, *, game_id: str, map_width: int
+) -> list[dict[str, object]]:
     """Pure function: one ``TickSnapshot`` -> its (state, action) example
     rows — one per living human with a ``legal`` entry, one row per
     modeled action they took during this window, or a single noop row if
@@ -52,9 +62,13 @@ def build_rows_for_tick(tick: TickSnapshot, *, game_id: str) -> list[dict[str, o
     ``snapshotEvery`` ticks) doesn't have per-intent-granularity state, so
     that's the finest resolution available; see
     ``docs/imitation_learning_plan.md`` Section 2.
+
+    ``map_width`` (the game's ``SnapshotHeader.width``) decodes intents'
+    TileRefs into ``target_x``/``target_y``.
     """
     rows: list[dict[str, object]] = []
     small_id_by_client = _small_id_by_client_id(tick)
+    small_id_by_player = _small_id_by_player_id(tick)
     player_by_small_id = {player.smallID: player for player in tick.players}
 
     for client_id, legality in tick.legal.items():
@@ -74,11 +88,17 @@ def build_rows_for_tick(tick: TickSnapshot, *, game_id: str) -> list[dict[str, o
         encoded = [
             action
             for intent in raw_intents
-            if (action := encode_action(intent, small_id_by_client_id=small_id_by_client))
+            if (
+                action := encode_action(
+                    intent, small_id_by_player_id=small_id_by_player, map_width=map_width
+                )
+            )
             is not None
         ]
         if not encoded:
-            noop = encode_action(None, small_id_by_client_id=small_id_by_client)
+            noop = encode_action(
+                None, small_id_by_player_id=small_id_by_player, map_width=map_width
+            )
             assert noop is not None  # encode_action(None, ...) always returns NOOP_ACTION
             encoded = [noop]
 
@@ -120,9 +140,14 @@ def build_dataset_for_game(game_id: str) -> Path | None:
         raise FileExistsError(f"{output_path} already exists; delete it first to regenerate")
 
     rows: list[dict[str, object]] = []
+    map_width: int | None = None
     for line in loader.iter_snapshots(game_id):
-        if isinstance(line, TickSnapshot):
-            rows.extend(build_rows_for_tick(line, game_id=game_id))
+        if isinstance(line, SnapshotHeader):
+            map_width = line.width
+        elif isinstance(line, TickSnapshot):
+            if map_width is None:
+                raise ValueError(f"{game_id}'s snapshot file has a tick before its header")
+            rows.extend(build_rows_for_tick(line, game_id=game_id, map_width=map_width))
 
     if not rows:
         logger.warning("%s produced zero rows; nothing written", game_id)

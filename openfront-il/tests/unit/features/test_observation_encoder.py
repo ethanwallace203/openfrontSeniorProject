@@ -6,13 +6,17 @@ import pytest
 
 from openfront_il.features.observation_encoder import (
     FLAT_FEATURES,
+    PLAYER_FEATURES,
     SPATIAL_CHANNELS,
+    TERRA_NULLIUS_SMALL_ID,
     encode_flat,
     encode_observation,
+    encode_player_candidates,
     encode_spatial,
 )
 from openfront_il.replay.snapshot_schema import (
     AllianceSnapshot,
+    AttackSnapshot,
     PlayerScalars,
     SnapshotHeader,
     TickSnapshot,
@@ -33,7 +37,7 @@ def _gzip_b64(data: bytes) -> str:
 def _make_header(terrain_bytes: list[int], width: int, height: int) -> SnapshotHeader:
     return SnapshotHeader(
         kind="header",
-        formatVersion=1,
+        formatVersion=2,
         gameId="test-game",
         gitCommit="deadbeef",
         map="TestMap",
@@ -70,6 +74,7 @@ def _make_tick(
 
 def _player(small_id: int, **overrides: object) -> PlayerScalars:
     defaults: dict[str, object] = dict(
+        id=f"pid{small_id}",
         clientID=f"client{small_id}",
         smallID=small_id,
         username=f"player{small_id}",
@@ -87,6 +92,12 @@ def _player(small_id: int, **overrides: object) -> PlayerScalars:
 
 
 class TestEncodeSpatial:
+    def test_is_uint8(self) -> None:
+        header = _make_header([0, 0], width=2, height=1)
+        tick = _make_tick([1, 0], players=[_player(1)])
+
+        assert encode_spatial(header, tick, viewer_small_id=1).dtype == np.uint8
+
     def test_terrain_and_ownership_channels(self) -> None:
         # A 2x2 map: tile 0 is land+shoreline, tile 1 is land only,
         # tile 2 is not land, tile 3 is not land.
@@ -221,6 +232,96 @@ class TestEncodeFlat:
         except ValueError:
             return
         raise AssertionError("expected ValueError")
+
+
+LAND = 1 << _IS_LAND_BIT
+
+
+class TestEncodePlayerCandidates:
+    """A 1x4 all-land strip owned [unowned, viewer(1), enemy(2), ally(3)]
+    plus a dead player 4."""
+
+    def _encode(self, **tick_overrides: object) -> tuple[np.ndarray, np.ndarray]:
+        header = _make_header([LAND] * 4, width=4, height=1)
+        tick = _make_tick(
+            [0, 1, 2, 3],
+            players=[
+                _player(3),
+                _player(1, troops=1000.0),
+                _player(2, troops=10.0, numTilesOwned=1, clientID=None),
+                _player(4, isAlive=False),
+            ],
+            alliances=[AllianceSnapshot(requestorSmallID=1, recipientSmallID=3, expiresAtTick=999)],
+        )
+        tick = tick.model_copy(update=tick_overrides)
+        return encode_player_candidates(header, tick, viewer_small_id=1)
+
+    def _feature(self, features: np.ndarray, row: int, name: str) -> float:
+        return float(features[row, PLAYER_FEATURES.index(name)])
+
+    def test_terra_nullius_first_then_living_others_by_small_id(self) -> None:
+        small_ids, features = self._encode()
+
+        assert small_ids.tolist() == [TERRA_NULLIUS_SMALL_ID, 2, 3]
+        assert features.shape == (3, len(PLAYER_FEATURES))
+        assert features.dtype == np.float32
+
+    def test_relation_flags(self) -> None:
+        _, features = self._encode()
+
+        assert self._feature(features, 0, "is_terra_nullius") == 1.0
+        assert self._feature(features, 1, "is_ally") == 0.0
+        assert self._feature(features, 2, "is_ally") == 1.0
+        assert self._feature(features, 1, "is_human") == 0.0  # no clientID: a nation/bot
+        assert self._feature(features, 2, "is_human") == 1.0
+
+    def test_shared_border_counts_land_edges_with_viewer(self) -> None:
+        _, features = self._encode()
+
+        # The viewer's single tile touches unowned land and player 2, not player 3.
+        assert self._feature(features, 0, "shared_border_log1p") == pytest.approx(np.log1p(1))
+        assert self._feature(features, 1, "shared_border_log1p") == pytest.approx(np.log1p(1))
+        assert self._feature(features, 2, "shared_border_log1p") == 0.0
+
+    def test_troop_advantage_is_relative_to_viewer(self) -> None:
+        _, features = self._encode()
+
+        expected = np.log1p(1000.0) - np.log1p(10.0)
+        assert self._feature(features, 1, "troop_advantage_log_ratio") == pytest.approx(expected)
+
+    def test_attack_flags(self) -> None:
+        attacks = [
+            AttackSnapshot(
+                id="a",
+                attackerSmallID=2,
+                targetSmallID=1,
+                troops=5.0,
+                retreating=False,
+                sourceX=None,
+                sourceY=None,
+            ),
+            AttackSnapshot(
+                id="b",
+                attackerSmallID=1,
+                targetSmallID=TERRA_NULLIUS_SMALL_ID,
+                troops=5.0,
+                retreating=False,
+                sourceX=None,
+                sourceY=None,
+            ),
+        ]
+
+        _, features = self._encode(attacks=attacks)
+
+        assert self._feature(features, 1, "is_attacking_viewer") == 1.0
+        assert self._feature(features, 0, "viewer_is_attacking") == 1.0
+        assert self._feature(features, 1, "viewer_is_attacking") == 0.0
+
+    def test_raises_for_unknown_viewer(self) -> None:
+        header = _make_header([LAND], width=1, height=1)
+        tick = _make_tick([0], players=[_player(2)])
+        with pytest.raises(ValueError, match="no player"):
+            encode_player_candidates(header, tick, viewer_small_id=1)
 
 
 class TestEncodeObservation:

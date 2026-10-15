@@ -55,7 +55,10 @@ export function snapshotPath(gameId: string): string {
  */
 export interface SnapshotHeader {
   kind: "header";
-  formatVersion: 1;
+  /**
+   * 2: PlayerScalars gained `id` (the engine PlayerID intents target by).
+   */
+  formatVersion: 2;
   gameId: string;
   gitCommit: string;
   map: string;
@@ -73,6 +76,16 @@ export interface SnapshotHeader {
 }
 
 export interface PlayerScalars {
+  /**
+   * The engine's PlayerID — what every intent target field (`targetID`,
+   * `recipient`, `target`, `requestor`) refers to. Distinct from
+   * `clientID` even for humans (every player, human or not, gets a
+   * PlayerID from the game's seeded RNG), and the only identifier nations
+   * and tribes have besides `smallID`. Deterministic per gameID, so a
+   * replayed game reproduces the live game's PlayerIDs exactly.
+   */
+  id: string;
+  /** null for nations and tribes; identifies whose connection sent an intent. */
   clientID: string | null;
   smallID: number;
   username: string;

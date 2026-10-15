@@ -2,7 +2,10 @@
 # hyperparameters belong in training/ code — see training/README.md.
 
 learning_rate: 0.001
-batch_size: 64
+# Full-resolution maps are big. Measured on a 3090 (24GB) at Europe size
+# (2904x1672) with bf16: batch 16 peaks at 13GB, batch 32 runs out of
+# memory. Raise it only if every game in the dataset is a small map.
+batch_size: 8
 epochs: 10
 seed: 1337
 checkpoint_dir: checkpoints
@@ -13,6 +16,10 @@ early_stopping_patience: 3
 # Per-head loss weights (see docs/imitation_learning_plan.md Section 2).
 action_type_loss_weight: 1.0
 unit_type_loss_weight: 1.0
+# Argument heads — each applies only to rows whose action type takes that
+# argument (see training/bc_trainer.py's module docstring).
+tile_target_loss_weight: 1.0
+target_player_loss_weight: 1.0
 
 # Downweights the "noop" class in the action_type head's cross-entropy —
 # see docs/imitation_learning_plan.md Section 3 for why (noop is expected
@@ -20,7 +27,32 @@ unit_type_loss_weight: 1.0
 # revisit once real class frequencies are measured.
 noop_downweight: 1.0
 
+# Fraction of noop examples kept per epoch (a fresh random subset each
+# epoch; every real action is always kept). Measured on the 96-game
+# dataset: 82% of 2.12M examples are noop, so 0.1 trains on ~26% of the
+# rows (~3.8x fewer). Kept noops are weighted by 1/noop_keep_fraction in
+# the loss, so the model still learns how often humans actually act.
+# 1.0 = no subsampling.
+noop_keep_fraction: 0.1
+
 # Game-level split fractions (docs/imitation_learning_plan.md Section 4).
 # The remainder after val+test is train.
 val_fraction: 0.1
 test_fraction: 0.1
+
+# Hardware. "auto" = CUDA if available, else CPU; "cuda" errors instead of
+# silently falling back to CPU.
+device: auto
+# Background processes rebuilding examples. Measured: one Europe-size
+# example takes ~117ms to rebuild on one core vs ~24ms to train on a 3090,
+# so fewer than ~5 workers leaves the GPU waiting. 0 = load in the
+# training process. Peak RAM is mostly batches queued by workers (2 per
+# worker): measured ~16GB total at Europe size with 8 workers, batch 16.
+num_workers: 8
+# bf16 autocast on CUDA. Measured on a 3090 at Europe size, batch 16:
+# 47 -> 24 ms/example and 17.8 -> 13.0GB peak. Ignored on CPU.
+mixed_precision: true
+
+# Log batches done, running loss, examples/sec and the epoch's ETA every
+# N training batches. 0 = only the end-of-epoch summary.
+log_every_batches: 500

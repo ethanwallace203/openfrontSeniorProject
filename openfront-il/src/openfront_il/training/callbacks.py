@@ -47,6 +47,38 @@ def log_epoch_metrics(
     )
 
 
+def log_progress(
+    epoch: int,
+    batches_done: int,
+    expected_batches: int,
+    running_loss: float,
+    examples_done: int,
+    elapsed_seconds: float,
+) -> None:
+    """Mid-epoch progress line: an epoch over a real dataset can take
+    hours, and the end-of-epoch summary alone gives no sign of life or
+    pace until then."""
+    rate = examples_done / max(elapsed_seconds, 1e-9)
+    remaining_batches = max(expected_batches - batches_done, 0)
+    eta_seconds = remaining_batches * (elapsed_seconds / max(batches_done, 1))
+    logger.info(
+        "epoch %d: batch %d/~%d (%.0f%%) running_loss=%.4f %.1f ex/s, epoch ETA %s",
+        epoch,
+        batches_done,
+        expected_batches,
+        100 * batches_done / max(expected_batches, 1),
+        running_loss,
+        rate,
+        _format_duration(eta_seconds),
+    )
+
+
+def _format_duration(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
+
+
 def checkpoint_if_best(
     policy: PolicyNetwork,
     metadata: CheckpointMetadata,

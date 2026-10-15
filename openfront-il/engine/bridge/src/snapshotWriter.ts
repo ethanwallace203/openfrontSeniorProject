@@ -62,7 +62,7 @@ export function buildTerrainHeader(
   }
   return {
     kind: "header",
-    formatVersion: 1,
+    formatVersion: 2,
     gameId,
     gitCommit,
     map,
@@ -77,6 +77,7 @@ export function buildTerrainHeader(
 
 function playerScalars(player: Player): PlayerScalars {
   return {
+    id: player.id(),
     clientID: player.clientID(),
     smallID: player.smallID(),
     username: player.name(),

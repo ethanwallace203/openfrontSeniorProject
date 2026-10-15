@@ -43,7 +43,7 @@ head (masking out illegal actions via the legality mask from
 | File | Responsibility |
 |---|---|
 | `config.py` | `TrainingConfig` from `configs/training.yaml` (lr, batch size, epochs, seed, per-head loss weights, checkpoint dir, split fractions) and `ModelConfig` from `configs/model.yaml` (architecture hyperparameters only — `in_channels`/`flat_dim`/head sizes are derived from `features/` constants at training time, not configured) |
-| `bc_trainer.py` | `split_game_ids()` (deterministic, game-level, per `docs/imitation_learning_plan.md` Section 4), `BCDataset` (reads `data/processed/*.parquet` plus `data/snapshots/` for on-demand spatial reconstruction — see above), `masked_cross_entropy()`, and `train()`: the loop itself — forward pass through `models.PolicyNetwork`, per-head cross-entropy with the `action_type` head's legality mask applied before the loss, backward, optimizer step, checkpointing the best epoch via `callbacks.py` |
+| `bc_trainer.py` | `split_game_ids()` (deterministic, game-level, per `docs/imitation_learning_plan.md` Section 4), `BCDataset` (reads `data/processed/*.parquet` plus `data/snapshots/` for on-demand spatial reconstruction — see above), `masked_cross_entropy()`, and `train()`: the loop itself — forward pass through `models.PolicyNetwork`, per-head cross-entropy with legality masks applied before the loss (`action_type`, and the `tile_target`/`target_player` argument heads, which are teacher-forced on the true action type and only trained on rows whose action type takes that argument), backward, optimizer step, checkpointing the best epoch via `callbacks.py` |
 | `callbacks.py` | checkpointing cadence, early stopping, metric logging (via `utils/logging.py`, not `print`) |
 | `seed.py` | one function, called at the start of every training script, that seeds `numpy`/`torch`/`random` from `config.seed` |
 
@@ -78,3 +78,74 @@ hypothetical one: expect either a GPU, a much smaller
 downsampling step this prototype does not currently implement, before
 attempting a real training run — don't assume the shipped defaults are
 tuned for CPU-only iteration speed.
+
+## GPU training (CUDA)
+
+`bc_trainer.train()` uses CUDA automatically when available (`device:
+auto` in `configs/training.yaml`; `cuda` to fail loudly instead of falling
+back to CPU), with bf16 autocast (`mixed_precision`) and `num_workers`
+background processes rebuilding examples. GPU-trained checkpoints load
+on CPU (`load_checkpoint` maps to CPU).
+
+Measured on an RTX 3090 (24GB) with `configs/model.yaml`'s defaults, on
+synthetic Europe-size (2904x1672) inputs:
+
+| | per example |
+|---|---|
+| CPU training (12 threads) | ~737 ms |
+| 3090 training, fp32, batch 16 | ~47 ms (17.8GB peak) |
+| 3090 training, bf16, batch 16 | ~24 ms (13.0GB peak) |
+| 3090, batch 32 | out of memory, fp32 and bf16 |
+| Rebuilding one example from snapshots (one CPU core) | ~117 ms |
+
+The last row is why `num_workers` matters: at ~117 ms to rebuild vs ~24
+ms to train, fewer than ~5 workers leave the GPU idle. Smaller maps are
+proportionally cheaper on every row.
+
+### RAM
+
+Measured on a synthetic Europe-size game (300 ticks, ~269KB per snapshot
+line — in the range of real games), `batch_size: 16`, 8 workers:
+
+| | RAM |
+|---|---|
+| Loading a whole game into memory (the old `ExampleTable`) | ~2.6x the snapshot file's size — ~87GB for a 100-game, ~33GB dataset |
+| `ExampleTable` now (on-demand reads from a byte-offset index) | ~2MB per game + ~20MB once |
+| Peak total during an epoch (main + 8 workers), `uint8` spatial | ~16GB |
+| Same, if spatial were float32 | ~45GB |
+
+The epoch peak is dominated by decoded batches waiting in the prefetch
+queue (`num_workers` x 2 batches), not by the dataset, so it stays
+roughly constant as the number of games grows. To lower it: fewer
+`num_workers` or a smaller `batch_size`. Workers are still forked
+explicitly on Linux (see `_make_loader`) so none of them pickles a copy
+of the table.
+
+### Real dataset (96 public games, 70 maps)
+
+2.12M examples, **82% noop**. Three measures keep an epoch practical:
+
+- **Noop subsampling** (`noop_keep_fraction`, default 0.1): each epoch
+  trains on every real action plus a fresh random 10% of noops (~26% of
+  rows); kept noops are weighted 1/0.1 in the loss so the learned noop
+  rate stays the true human one. Validation uses one fixed subset so its
+  loss is comparable across epochs.
+- **Map-grouped batches** (`MapGroupedBatchSampler`): every batch comes
+  from one map size, so nothing is padded. Mixed-map batches padded to
+  the batch's tallest height *and* widest width — up to 11.4M tiles here,
+  bigger than any real map — which ran the 3090 out of memory.
+- **Non-persistent validation workers**, and `scripts/04_train_bc.py`
+  defaults `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` so varying
+  batch shapes don't fragment GPU memory.
+
+Measured on the 3090, `batch_size: 8`, 8 workers, 1.69M training
+examples:
+
+| | Before | After |
+|---|---|---|
+| One epoch | ~15 h | **~2.5 h** (49 ex/s steady, GPU 96% busy) |
+| Peak GPU memory | out of memory at batch 16; ~22GB at 8 | ~14GB |
+| Peak system RAM (whole machine) | ~38GB + swap | ~27GB, no swap |
+
+`log_every_batches` prints batches done, running loss, examples/sec and
+the epoch's ETA, so a multi-hour epoch shows progress.
