@@ -25,7 +25,8 @@ tests/
 │   ├── models/
 │   ├── training/
 │   ├── evaluation/
-│   └── utils/
+│   ├── utils/
+│   └── env/
 └── integration/    # small end-to-end run on 1-2 tiny fixture games, marked slow
 ```
 

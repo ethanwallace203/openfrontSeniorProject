@@ -164,7 +164,17 @@ async function loadFreshTerrain(map: GameMapType, mapSize: GameMapSize): Promise
 // ---------------------------------------------------------------------------
 
 async function bootGame(record: GameRecord): Promise<{ game: Game; executor: Executor }> {
-  const info = record.info as GameStartInfo;
+  return bootGameFromStartInfo(record.info as GameStartInfo);
+}
+
+/**
+ * The boot sequence proper, keyed only on GameStartInfo so ilDaemon.ts can
+ * boot a fresh live game through the exact code path the replay tests
+ * hash-verify against real games.
+ */
+export async function bootGameFromStartInfo(
+  info: GameStartInfo,
+): Promise<{ game: Game; executor: Executor }> {
   const gameConfig = info.config;
 
   const mapType = gameConfig.gameMap as GameMapType;
@@ -242,7 +252,7 @@ async function bootGame(record: GameRecord): Promise<{ game: Game; executor: Exe
   return { game, executor };
 }
 
-function normalizeWinner(raw: unknown): { kind: string; id: string } | null {
+export function normalizeWinner(raw: unknown): { kind: string; id: string } | null {
   if (!Array.isArray(raw) || raw.length < 2) return null;
   return { kind: String(raw[0]), id: String(raw[1]) };
 }

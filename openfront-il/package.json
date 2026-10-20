@@ -7,6 +7,7 @@
   "scripts": {
     "fetch": "tsx --tsconfig tsconfig.run.json engine/bridge/src/fetchGame.ts",
     "replay": "tsx --tsconfig tsconfig.run.json engine/bridge/src/replayGame.ts",
+    "daemon": "tsx --tsconfig tsconfig.run.json engine/bridge/src/ilDaemon.ts",
     "lint": "eslint engine/bridge/src engine/bridge/tests",
     "format": "prettier --write engine/bridge",
     "test": "vitest run engine/bridge/tests"
