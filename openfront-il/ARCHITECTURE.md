@@ -95,6 +95,16 @@ is the same tradeoff the reference project's `bridge/` design converged on
 for its persistent process, applied here in its simplest form (plain files,
 no persistent process at all) since we don't need interactive step/reset.
 
+**Exception — live play.** Running the trained policy in a game *does*
+need interactive reset/step: the policy must see tick N before choosing
+the intents that shape tick N+1. That is confined to
+`src/openfront_il/env/`, which drives `engine/bridge/src/ilDaemon.ts` as a
+subprocess over stdio (never importing engine code). The daemon builds its
+observations with the same `buildTickSnapshot` that writes the training
+snapshots, so the file boundary's guarantee — one well-defined observation
+format — still holds. The offline pipeline above is unchanged. See
+`src/openfront_il/env/README.md` and `docs/live_play_plan.md`.
+
 ## Design decisions carried over from prior art
 
 - **Observation encoding**: compress only the large, high-dimensional state

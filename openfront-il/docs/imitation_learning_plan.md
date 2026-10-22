@@ -77,28 +77,35 @@ separate action type in the engine — they're `build_unit` targeted at an
 enemy tile — so this head is also what distinguishes "build a Missile
 Silo" from "launch an Atom Bomb."
 
-### What's *not* a discrete head: tile and player targets
+### Tile and player targets: pointer heads, not fixed classifiers
 
-Attack/boat/build/move-warship all carry a target tile; attack/alliance/
-donate/embargo/targetPlayer carry a target player. Neither is modeled as
-a fixed-size classification head:
+Spawn/boat/build/move-warship carry a target tile
+(`TILE_TARGET_ACTION_TYPES`); attack/alliance/donate/embargo/targetPlayer
+carry a target player (`PLAYER_TARGET_ACTION_TYPES`). Neither can be a
+fixed-size classification head — one class per tile is millions of
+classes and map-size-dependent, and a per-game player roster has no
+stable class index across games. So `action_encoder.py` stores both raw
+on the label (`target_x`/`target_y` decoded from the intent's TileRef;
+`target_player_small_id`, with an `attack` on unowned land labeled as
+terra nullius), and `models/policy_network.py` predicts them with
+*pointer* heads that score a variable number of choices:
 
-- **Tile targets** (`x, y`): a discrete head would need one class per tile
-  (millions, and map-size-dependent). `action_encoder.py` passes the raw
-  `(x, y)` through on the label instead of one-hot encoding it.
-  `models/policy_network.py` is free to consume this as an auxiliary
-  regression target or a spatial (H×W heatmap) head sharing the spatial
-  encoder's feature map — that architecture choice belongs in `models/`,
-  not here.
-- **Player targets** (`target_player_small_id`): a per-game player roster
-  varies in size and identity, so there's no fixed, meaningful class index
-  across games. Passed through raw on the label for the same reason.
+- **`tile_target`**: one logit per cell of the spatial encoder's feature
+  map (1/8 resolution with the default three conv layers), from a 1x1
+  conv scored against a query from the trunk. The label is the cell
+  containing `(target_x, target_y)`.
+- **`target_player`**: one logit per candidate player (terra nullius plus
+  every other living player, described by `PLAYER_FEATURES` — relation,
+  size, troop advantage, shared border, who's attacking whom), scored the
+  same way. The label is the target's index among the candidates.
 
-This is the single biggest scope-reduction in this plan, and it's why
-Section 5's success criteria measure *action-type* prediction, not
-full-fidelity action reproduction. A follow-on stage that wants targeting
-fidelity needs to add a spatial or relative-ranking head — noted in
-`docs/rl_handoff.md`.
+Both are conditioned on the action type and trained only on rows whose
+action type takes that argument, with per-argument legality masks
+(`encode_tile_target_mask`, `encode_player_target_mask`). Intent target
+fields hold engine **PlayerIDs** (not clientIDs — the two differ even for
+humans), resolved through `PlayerScalars.id` (snapshot format v2). One
+known gap: targets are cell-precise, not tile-precise (an 8x8-tile cell;
+play-time code picks a tile within it).
 
 ### Legality masking, and its real limit
 
@@ -184,7 +191,11 @@ this prototype's bar is:
    class turns out to be — for every example). Beating that baseline on
    the *non-noop* classes specifically matters more than raw accuracy,
    since a model that only ever predicts `noop` would score deceptively
-   well on the imbalanced full distribution.
+   well on the imbalanced full distribution. The argument heads
+   (`tile_target`, `target_player`) are scored on only the examples that
+   take that argument, conditioned on the true action type, against a
+   uniform-over-legal-choices baseline (their number of choices varies
+   per example, so a most-common-class baseline doesn't apply).
 2. **Is the resulting checkpoint loadable by a follow-on RL stage?**
    `models/checkpoint_format.py` defines the saved schema;
    `evaluation/held_out_report.py` should confirm a freshly loaded

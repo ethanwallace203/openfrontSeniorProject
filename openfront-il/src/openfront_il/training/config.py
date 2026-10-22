@@ -7,6 +7,7 @@ through this module.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel
@@ -21,9 +22,22 @@ class TrainingConfig(BaseModel):
     early_stopping_patience: int
     action_type_loss_weight: float = 1.0
     unit_type_loss_weight: float = 1.0
+    tile_target_loss_weight: float = 1.0
+    target_player_loss_weight: float = 1.0
     noop_downweight: float = 1.0
+    # Fraction of noop examples kept each epoch (all real actions are
+    # always kept). Kept noops are re-weighted by 1 / this in the loss, so
+    # the model still learns the true human noop rate.
+    noop_keep_fraction: float = 1.0
+    # Log progress every N training batches; 0 = only once per epoch.
+    log_every_batches: int = 0
     val_fraction: float = 0.1
     test_fraction: float = 0.1
+    # Hardware. Defaults are the safe, portable choice (they're what tests
+    # use); configs/training.yaml sets the fast ones.
+    device: Literal["auto", "cuda", "cpu"] = "auto"
+    num_workers: int = 0
+    mixed_precision: bool = False
 
 
 class SpatialEncoderArchConfig(BaseModel):

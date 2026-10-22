@@ -39,7 +39,7 @@ _FALLOUT_BIT = 13
 _DEFENSE_BONUS_BIT = 14
 
 # TerraNullius's reserved "unowned land" sentinel smallID (engine convention).
-_TERRA_NULLIUS_SMALL_ID = 0
+TERRA_NULLIUS_SMALL_ID = 0
 
 # Spatial tensor channel order — the single source of truth for what
 # channel N in encode_spatial()'s output means. Never hardcode a channel
@@ -78,6 +78,30 @@ FLAT_FEATURES = [
     "spawn_phase",
 ]
 
+# Per-candidate feature order for the target_player pointer head — same
+# source-of-truth convention. Every feature is relative to the viewer
+# (ally/enemy, troop advantage, shared border), never a raw player ID,
+# for the same reason as the spatial channels: an ID means nothing across
+# games, but "my largest neighbor, who is attacking me" does.
+PLAYER_FEATURES = [
+    "is_terra_nullius",
+    "is_ally",
+    "is_human",
+    "is_traitor",
+    "tiles_owned_log1p",
+    "troops_log1p",
+    "gold_log1p",
+    # log1p(viewer troops) - log1p(candidate troops): > 0 means the viewer
+    # outnumbers them.
+    "troop_advantage_log_ratio",
+    # Count of 4-neighbor tile edges between the viewer's territory and
+    # this candidate's (land only, so open ocean never counts as a border
+    # with terra nullius).
+    "shared_border_log1p",
+    "is_attacking_viewer",
+    "viewer_is_attacking",
+]
+
 
 def decode_terrain(header: SnapshotHeader) -> np.ndarray:
     """Decodes the gzip+base64 terrain buffer into a ``(height, width)``
@@ -110,26 +134,32 @@ def _allied_small_ids(tick: TickSnapshot, viewer_small_id: int) -> set[int]:
 def encode_spatial(header: SnapshotHeader, tick: TickSnapshot, viewer_small_id: int) -> np.ndarray:
     """Builds the ``(len(SPATIAL_CHANNELS), height, width)`` spatial
     tensor for one tick, from ``viewer_small_id``'s perspective.
+
+    ``uint8``, not float: every channel is exactly 0 or 1, so one byte per
+    value loses nothing and is 4x smaller than float32 — a Europe-size
+    example is ~34MB instead of ~136MB, which is what decides how many
+    prefetched batches fit in RAM and how fast they copy to the GPU.
+    ``SpatialEncoder`` casts to float itself, on whatever device it runs on.
     """
     terrain = decode_terrain(header)
     tile_state = decode_tile_state(header, tick)
 
-    is_land = ((terrain >> _IS_LAND_BIT) & 1).astype(np.float32)
-    is_shoreline = ((terrain >> _SHORELINE_BIT) & 1).astype(np.float32)
+    is_land = ((terrain >> _IS_LAND_BIT) & 1).astype(np.uint8)
+    is_shoreline = ((terrain >> _SHORELINE_BIT) & 1).astype(np.uint8)
 
     owner_id = tile_state & _PLAYER_ID_MASK
     allies = _allied_small_ids(tick, viewer_small_id)
     ally_list = list(allies)
 
-    owned_by_viewer = (owner_id == viewer_small_id).astype(np.float32)
-    owned_by_ally = np.isin(owner_id, ally_list).astype(np.float32)
-    is_owned = owner_id != _TERRA_NULLIUS_SMALL_ID
+    owned_by_viewer = (owner_id == viewer_small_id).astype(np.uint8)
+    owned_by_ally = np.isin(owner_id, ally_list).astype(np.uint8)
+    is_owned = owner_id != TERRA_NULLIUS_SMALL_ID
     owned_by_enemy = (
         is_owned & (owner_id != viewer_small_id) & ~np.isin(owner_id, ally_list)
-    ).astype(np.float32)
+    ).astype(np.uint8)
 
-    has_fallout = ((tile_state >> _FALLOUT_BIT) & 1).astype(np.float32)
-    has_defense_bonus = ((tile_state >> _DEFENSE_BONUS_BIT) & 1).astype(np.float32)
+    has_fallout = ((tile_state >> _FALLOUT_BIT) & 1).astype(np.uint8)
+    has_defense_bonus = ((tile_state >> _DEFENSE_BONUS_BIT) & 1).astype(np.uint8)
 
     return np.stack(
         [
@@ -195,6 +225,101 @@ def encode_flat(tick: TickSnapshot, viewer_small_id: int) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+
+def _border_edge_counts(
+    owner_id: np.ndarray, is_land: np.ndarray, viewer_small_id: int
+) -> np.ndarray:
+    """``(len(owner smallID space),)`` count of 4-neighbor edges from a
+    viewer-owned tile to a land tile owned by each smallID."""
+    mine = owner_id == viewer_small_id
+    counts = np.zeros(_PLAYER_ID_MASK + 1, dtype=np.int64)
+    # (from, to) slice pairs covering each of the four neighbor directions.
+    shifts = [
+        ((slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+        ((slice(None), slice(1, None)), (slice(None), slice(None, -1))),
+        ((slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+        ((slice(1, None), slice(None)), (slice(None, -1), slice(None))),
+    ]
+    for source, neighbor in shifts:
+        crossing = mine[source] & ~mine[neighbor] & is_land[neighbor]
+        counts += np.bincount(owner_id[neighbor][crossing], minlength=len(counts))
+    return counts
+
+
+def encode_player_candidates(
+    header: SnapshotHeader, tick: TickSnapshot, viewer_small_id: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Builds the candidate set for the ``target_player`` head, from
+    ``viewer_small_id``'s perspective.
+
+    Candidates are terra nullius first (so "attack unowned land" — the
+    most common attack in the game — is a target like any other), then
+    every other living player in ascending smallID order. The viewer is
+    never a candidate.
+
+    Returns:
+        ``(small_ids [N] int64, features [N, len(PLAYER_FEATURES)]
+        float32)``.
+
+    Raises:
+        ValueError: if no player in this tick has ``viewer_small_id``.
+    """
+    viewer = next((p for p in tick.players if p.smallID == viewer_small_id), None)
+    if viewer is None:
+        raise ValueError(f"no player with smallID {viewer_small_id} in this tick")
+
+    is_land = ((decode_terrain(header) >> _IS_LAND_BIT) & 1).astype(bool)
+    owner_id = decode_tile_state(header, tick) & _PLAYER_ID_MASK
+    border = _border_edge_counts(owner_id, is_land, viewer_small_id)
+    allies = _allied_small_ids(tick, viewer_small_id)
+    attacking_viewer = {
+        a.attackerSmallID for a in tick.attacks if a.targetSmallID == viewer_small_id
+    }
+    attacked_by_viewer = {
+        a.targetSmallID for a in tick.attacks if a.attackerSmallID == viewer_small_id
+    }
+    viewer_troops_log = np.log1p(viewer.troops)
+
+    unowned_land = int((is_land & (owner_id == TERRA_NULLIUS_SMALL_ID)).sum())
+    small_ids = [TERRA_NULLIUS_SMALL_ID]
+    rows = [
+        [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            np.log1p(unowned_land),
+            0.0,
+            0.0,
+            viewer_troops_log,
+            np.log1p(border[TERRA_NULLIUS_SMALL_ID]),
+            0.0,
+            float(TERRA_NULLIUS_SMALL_ID in attacked_by_viewer),
+        ]
+    ]
+    others = sorted(
+        (p for p in tick.players if p.smallID != viewer_small_id and p.isAlive),
+        key=lambda p: p.smallID,
+    )
+    for player in others:
+        small_ids.append(player.smallID)
+        rows.append(
+            [
+                0.0,
+                float(player.smallID in allies),
+                float(player.clientID is not None),
+                float(player.isTraitor),
+                np.log1p(player.numTilesOwned),
+                np.log1p(player.troops),
+                np.log1p(float(player.gold)),
+                viewer_troops_log - np.log1p(player.troops),
+                np.log1p(border[player.smallID]),
+                float(player.smallID in attacking_viewer),
+                float(player.smallID in attacked_by_viewer),
+            ]
+        )
+    return np.array(small_ids, dtype=np.int64), np.array(rows, dtype=np.float32)
 
 
 def encode_observation(

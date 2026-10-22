@@ -40,7 +40,10 @@ methodology this pipeline implements.
   snapshots: featurization, modeling, training, evaluation.
 - The two sides talk **only through files on disk** (JSON/JSONL/Parquet
   under `data/`). No RPC, no shared memory, no cross-language calls at
-  runtime. See `data/README.md` for the stage contract.
+  runtime. See `data/README.md` for the stage contract. The one exception
+  is live play (`src/openfront_il/env/`), which needs interactive
+  reset/step and drives `engine/bridge/src/ilDaemon.ts` as a subprocess —
+  see `src/openfront_il/env/README.md`.
 
 ## Quickstart
 

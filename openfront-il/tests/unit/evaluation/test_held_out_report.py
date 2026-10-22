@@ -7,6 +7,7 @@ from openfront_il.evaluation import held_out_report
 from openfront_il.features import dataset_builder
 from openfront_il.features.action_encoder import ACTION_TYPES, UNIT_TYPES
 from openfront_il.models.checkpoint_format import (
+    FORMAT_VERSION,
     CheckpointMetadata,
     PolicyNetworkConfig,
     SpatialEncoderConfig,
@@ -29,7 +30,11 @@ def _processed_fixture() -> None:
 
 
 def _tiny_checkpoint(tmp_path: Path) -> Path:
-    from openfront_il.features.observation_encoder import FLAT_FEATURES, SPATIAL_CHANNELS
+    from openfront_il.features.observation_encoder import (
+        FLAT_FEATURES,
+        PLAYER_FEATURES,
+        SPATIAL_CHANNELS,
+    )
 
     metadata = CheckpointMetadata(
         spatial_encoder_config=SpatialEncoderConfig(
@@ -39,6 +44,7 @@ def _tiny_checkpoint(tmp_path: Path) -> Path:
             flat_dim=len(FLAT_FEATURES),
             action_type_count=len(ACTION_TYPES),
             unit_type_count=len(UNIT_TYPES),
+            player_feature_dim=len(PLAYER_FEATURES),
             hidden_dim=8,
         ),
     )
@@ -62,7 +68,7 @@ class TestRunInference:
             len(results.action_type_predictions),
             len(ACTION_TYPES),
         )
-        assert metadata.format_version == 1
+        assert metadata.format_version == FORMAT_VERSION
 
 
 class TestComputeMetrics:
@@ -80,8 +86,29 @@ class TestComputeMetrics:
             result.action_type_legality_violation_rate,
             result.unit_type_accuracy,
             result.unit_type_baseline_accuracy,
+            result.tile_target_accuracy,
+            result.tile_target_baseline_accuracy,
+            result.target_player_accuracy,
+            result.target_player_baseline_accuracy,
         ):
             assert 0.0 <= value <= 1.0
+
+    def test_counts_only_examples_that_take_each_argument(
+        self, tmp_path: Path, _processed_fixture: None
+    ) -> None:
+        checkpoint_path = _tiny_checkpoint(tmp_path)
+        results, metadata = held_out_report.run_inference(checkpoint_path, ["USR3SJiv"])
+
+        result = held_out_report.compute_metrics(checkpoint_path, metadata.format_version, results)
+
+        # The fixture's only tile-taking actions are its two spawns; it has
+        # no player-targeting actions at all.
+        assert (
+            result.tile_target_examples
+            == (results.action_type_labels == ACTION_TYPES.index("spawn")).sum()
+        )
+        assert result.tile_target_examples > 0
+        assert result.target_player_examples == 0
 
 
 class TestEvaluateAndReport:
@@ -95,5 +122,7 @@ class TestEvaluateAndReport:
         content = output_path.read_text(encoding="utf-8")
         assert "action_type" in content
         assert "unit_type" in content
+        assert "tile_target" in content
+        assert "target_player" in content
         assert str(result.num_examples) in content
-        assert "format_version=1" in content
+        assert f"format_version={FORMAT_VERSION}" in content

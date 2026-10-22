@@ -24,10 +24,12 @@ directly.
 Only `engine/bridge/src/*`. Nothing in `src/openfront_il/` (Python) may
 import from here, link against it, or call into it at runtime — the Python
 side only ever reads the files `bridge/` has already written to `data/`.
-`src/openfront_il/ingestion/orchestrator.py` is the one exception allowed to
-*invoke* the Node CLI as a subprocess (see `ingestion/README.md`), but even
-that never imports engine code directly — it shells out and checks exit
-codes.
+`src/openfront_il/ingestion/orchestrator.py` is allowed to *invoke* the
+Node CLI as a subprocess (see `ingestion/README.md`), but even that never
+imports engine code directly — it shells out and checks exit codes.
+`src/openfront_il/env/daemon_client.py` is the second such exception: it
+runs `bridge/src/ilDaemon.ts` as a long-lived subprocess for live play and
+talks to it over stdio (see `src/openfront_il/env/README.md`).
 
 ## Windows: `core.autocrlf` will corrupt the vendored binary map files
 

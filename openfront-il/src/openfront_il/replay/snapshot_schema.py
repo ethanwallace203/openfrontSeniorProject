@@ -37,7 +37,10 @@ class SnapshotHeader(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal["header"]
-    formatVersion: Literal[1]
+    # 2: PlayerScalars gained `id`. Version-1 files fail validation here
+    # rather than silently producing unresolvable player targets —
+    # regenerate them with engine/bridge/src/replayGame.ts.
+    formatVersion: Literal[2]
     gameId: str
     gitCommit: str
     map: str
@@ -50,6 +53,10 @@ class SnapshotHeader(BaseModel):
 class PlayerScalars(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # The engine PlayerID: what intent target fields (targetID, recipient,
+    # target, requestor) refer to — never clientID, even for humans. See
+    # types.ts for the full explanation.
+    id: str
     clientID: str | None
     smallID: int
     username: str
