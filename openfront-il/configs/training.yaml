@@ -2,7 +2,7 @@
 # hyperparameters belong in training/ code — see training/README.md.
 
 learning_rate: 0.001
-batch_size: 64
+batch_size: 4
 epochs: 10
 seed: 1337
 checkpoint_dir: checkpoints

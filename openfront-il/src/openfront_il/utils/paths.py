@@ -27,6 +27,9 @@ DATA_DIR = _resolve_data_dir()
 RAW_DIR = DATA_DIR / "raw"
 SNAPSHOTS_DIR = DATA_DIR / "snapshots"
 PROCESSED_DIR = DATA_DIR / "processed"
+# Games the agent played live (engine/bridge/src/liveGame.ts). Kept out of
+# RAW_DIR on purpose so they never leak into the human training dataset.
+AGENT_GAMES_DIR = DATA_DIR / "agent_games"
 
 
 def raw_game_path(game_id: str) -> Path:

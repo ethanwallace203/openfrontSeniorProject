@@ -73,6 +73,10 @@ export interface SnapshotHeader {
 }
 
 export interface PlayerScalars {
+  /** The engine's PlayerID — what intents reference players by
+   * (attack.targetID, donate_*.recipient, ...). Not the same as clientID,
+   * and the only stable handle for nations/bots, which have no clientID. */
+  id: string;
   clientID: string | null;
   smallID: number;
   username: string;

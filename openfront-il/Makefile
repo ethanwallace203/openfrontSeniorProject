@@ -1,4 +1,9 @@
-.PHONY: fetch replay build-dataset train eval test lint
+.PHONY: install fetch replay build-dataset train eval test lint
+
+# Python deps, with torch resolved against the CUDA wheel index so training
+# uses the GPU when one is present (falls back to CPU transparently if not).
+install:
+	pip install -e ".[dev]" --upgrade --extra-index-url https://download.pytorch.org/whl/cu126
 
 # Stage 1: fetch raw finished games from the public API -> data/raw/
 fetch:

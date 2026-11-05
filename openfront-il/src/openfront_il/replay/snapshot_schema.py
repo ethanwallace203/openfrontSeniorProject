@@ -50,6 +50,10 @@ class SnapshotHeader(BaseModel):
 class PlayerScalars(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # The engine's PlayerID — what intents reference players by
+    # (attack.targetID, donate_*.recipient, ...); not the same as clientID.
+    # Optional only so snapshots written before it was recorded still parse.
+    id: str | None = None
     clientID: str | None
     smallID: int
     username: str

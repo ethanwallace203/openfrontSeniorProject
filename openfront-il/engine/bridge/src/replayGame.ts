@@ -105,7 +105,7 @@ function createNodeMapLoader(): GameMapLoader {
  * per-game ownership state. Reusing a cached instance across games would
  * silently leak one game's tile ownership into the next.
  */
-async function loadFreshTerrain(map: GameMapType, mapSize: GameMapSize): Promise<TerrainMapData> {
+export async function loadFreshTerrain(map: GameMapType, mapSize: GameMapSize): Promise<TerrainMapData> {
   const mapFiles = createNodeMapLoader().getMapData(map);
   const manifest = await mapFiles.manifest();
 
@@ -242,7 +242,7 @@ async function bootGame(record: GameRecord): Promise<{ game: Game; executor: Exe
   return { game, executor };
 }
 
-function normalizeWinner(raw: unknown): { kind: string; id: string } | null {
+export function normalizeWinner(raw: unknown): { kind: string; id: string } | null {
   if (!Array.isArray(raw) || raw.length < 2) return null;
   return { kind: String(raw[0]), id: String(raw[1]) };
 }

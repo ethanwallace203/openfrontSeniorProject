@@ -173,11 +173,16 @@ def _compute_loss(
     return action_loss + unit_loss, logits
 
 
+def _batch_to_device(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
+    return {key: value.to(device) for key, value in batch.items()}
+
+
 def _evaluate(
     policy: PolicyNetwork,
     data_loader: DataLoader[dict[str, Tensor]],
     training_config: TrainingConfig,
     action_type_weight: Tensor,
+    device: torch.device,
 ) -> tuple[float, dict[str, float]]:
     policy.eval()
     total_loss = 0.0
@@ -186,6 +191,7 @@ def _evaluate(
     correct_unit_type = 0
     with torch.no_grad():
         for batch in data_loader:
+            batch = _batch_to_device(batch, device)
             loss, logits = _compute_loss(policy, batch, training_config, action_type_weight)
             batch_size = batch["action_type"].shape[0]
             total_loss += loss.item() * batch_size
@@ -239,6 +245,9 @@ def train(training_config: TrainingConfig, model_config: ModelConfig) -> Path:
     """
     seed_everything(training_config.seed)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("training on device: %s", device)
+
     game_ids = sorted(path.stem for path in paths.PROCESSED_DIR.glob("*.parquet"))
     if not game_ids:
         raise RuntimeError("no processed games found in data/processed/ — run build_dataset first")
@@ -270,12 +279,14 @@ def train(training_config: TrainingConfig, model_config: ModelConfig) -> Path:
             )
 
     policy, metadata = build_model_for_config(model_config)
+    policy.to(device)
     metadata.training_config = training_config.model_dump()
     metadata.seed = training_config.seed
     optimizer = torch.optim.Adam(policy.parameters(), lr=training_config.learning_rate)
 
     action_type_weight = torch.ones(len(ACTION_TYPES))
     action_type_weight[ACTION_TYPES.index("noop")] = training_config.noop_downweight
+    action_type_weight = action_type_weight.to(device)
 
     early_stopping = EarlyStopping(patience=training_config.early_stopping_patience)
     best_val_loss = float("inf")
@@ -286,6 +297,7 @@ def train(training_config: TrainingConfig, model_config: ModelConfig) -> Path:
         total_train_loss = 0.0
         total_examples = 0
         for batch in train_loader:
+            batch = _batch_to_device(batch, device)
             optimizer.zero_grad()
             loss, _ = _compute_loss(policy, batch, training_config, action_type_weight)
             # torch's own stub gap marks Tensor.backward as untyped, not ours to fix.
@@ -298,7 +310,7 @@ def train(training_config: TrainingConfig, model_config: ModelConfig) -> Path:
 
         if val_loader is not None:
             val_loss, val_metrics = _evaluate(
-                policy, val_loader, training_config, action_type_weight
+                policy, val_loader, training_config, action_type_weight, device
             )
         else:
             val_loss, val_metrics = train_loss, {}
