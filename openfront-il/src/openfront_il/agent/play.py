@@ -1,24 +1,20 @@
 """The play loop: a trained BC policy controlling the human seat in a live,
 headless game against nations and tribes.
 
-Each step:
+Each decision (``PolicyAgent.act``):
 
-    snapshot -> encode_observation -> policy -> logits
-             -> legality-masked action_type (+ unit_type for builds)
-             -> target player / build tile  (temporary rules, see below)
-             -> ActionDecoder.decode_action -> intent -> LiveGame.step
+    1. snapshot -> build_inputs        (the same encoders training used)
+    2. policy -> action_type logits -> action_type_mask -> choose_action_type
+    3. argument_logits                 (second pass, conditioned on that action)
+    4. unit_type / tile_target / target_player / amount -> ActionDecoder
+       -> EncodedAction -> decode_action -> intent -> LiveGame.step
 
-The observation goes through the exact ``encode_observation`` the training
-rows were built from, and action_type is masked with the same
-``encode_legality_mask`` the trainer's loss used, so the policy sees what
-it was trained on.
-
-**Temporary rules.** The policy only has ``action_type`` and ``unit_type``
-heads. Until target-player / tile / amount heads exist, those parts of an
-action come from simple rules here (``_pick_target``, ``_pick_build_tile``)
-and amounts are left ``null`` (the engine's own default). Action types the
-agent can't fully specify yet are masked out (``UNSUPPORTED_ACTIONS``), so
-the policy's probability mass is spread over the ones it can.
+Every choice is legality-masked with the same masks training used
+(``encode_legality_mask``, ``encode_tile_target_mask``,
+``encode_player_target_mask``), so the policy sees what it was trained on
+and never picks something the engine would reject. Action types whose
+intent needs the ID of one of the agent's own units are never chosen
+(``UNDECODABLE_ACTIONS``) — no head predicts one yet.
 """
 
 from __future__ import annotations
@@ -33,22 +29,33 @@ import numpy as np
 import torch
 
 from openfront_il.agent.live_game import AGENT_CLIENT_ID, LiveGame
-from openfront_il.features.action_decoder import ActionDecoder
+from openfront_il.features.action_decoder import NEEDS_UNIT_ID, ActionDecoder
 from openfront_il.features.action_encoder import (
     ACTION_TYPES,
+    AMOUNT_ACTION_TYPES,
+    PLAYER_TARGET_ACTION_TYPES,
+    TILE_TARGET_ACTION_TYPES,
     UNIT_TYPES,
     EncodedAction,
     encode_legality_mask,
+    encode_player_target_mask,
+    encode_tile_target_mask,
 )
 from openfront_il.features.observation_encoder import (
     SPATIAL_CHANNELS,
+    decode_tile_state,
     encode_candidate_cells,
     encode_observation,
     encode_player_candidates,
 )
 from openfront_il.models.checkpoint_format import load_checkpoint
 from openfront_il.models.policy_network import PolicyNetwork
-from openfront_il.replay.snapshot_schema import LegalityMask, SnapshotHeader, TickSnapshot
+from openfront_il.replay.snapshot_schema import (
+    LegalityMask,
+    PlayerScalars,
+    SnapshotHeader,
+    TickSnapshot,
+)
 from openfront_il.utils import paths
 
 logger = logging.getLogger(__name__)
@@ -57,55 +64,45 @@ DEFAULT_CHECKPOINT = paths.PROJECT_ROOT / "checkpoints" / "best.pt"
 
 _ACTION_INDEX = {name: index for index, name in enumerate(ACTION_TYPES)}
 
-# Action types that need something the agent can't produce yet: a unit/attack
-# ID (no head or rule for picking one of the agent's units), a boat
-# destination plus a required troop count, or a spawn tile (spawn is random).
-UNSUPPORTED_ACTIONS = frozenset(
-    {
-        "spawn",
-        "boat",
-        "upgrade_structure",
-        "move_warship",
-        "cancel_boat",
-        "cancel_attack",
-        "delete_unit",
-    }
-)
+# Action types the agent never chooses: those whose intent needs the ID of
+# one of its own units/attacks (no head predicts one — see the decoder's
+# NEEDS_UNIT_ID), and spawn (the agent spawns randomly; liveGame.ts handles
+# it before the first decision).
+UNDECODABLE_ACTIONS = NEEDS_UNIT_ID | {"spawn"}
 
-# Action type -> the LegalityMask list of smallIDs it may target. Mirrors
-# encode_legality_mask's backing signals.
-TARGET_CANDIDATES = {
-    "attack": "attackablePlayerSmallIDs",
-    "allianceRequest": "allianceRequestablePlayerSmallIDs",
-    "allianceReject": "allianceAcceptablePlayerSmallIDs",
-    "allianceExtension": "breakableAlliancePlayerSmallIDs",
-    "breakAlliance": "breakableAlliancePlayerSmallIDs",
-    "donate_gold": "donatableGoldPlayerSmallIDs",
-    "donate_troops": "donatableTroopsPlayerSmallIDs",
-    "embargo": "embargoablePlayerSmallIDs",
-    "targetPlayer": "targetablePlayerSmallIDs",
-}
+# The heads PolicyNetwork conditions on the chosen action type (step 3);
+# action_type and unit_type don't depend on it.
+ARGUMENT_HEADS = ("tile_target", "target_player", "amount")
 
-# smallID the decoder turns into targetID=null — i.e. "attack unclaimed land".
-_EXPAND = 0
+# The engine refuses a new transport while this many are already at sea
+# (Config.boatMaxNumber() / TransportShipUtils.canBuildTransportShip).
+MAX_BOATS_AT_SEA = 3
 
-_NUKES = frozenset({"Atom Bomb", "Hydrogen Bomb", "MIRV"})
-_NAVAL = frozenset({"Port", "Warship"})
-_CH_LAND = SPATIAL_CHANNELS.index("is_land")
-_CH_SHORE = SPATIAL_CHANNELS.index("is_shoreline")
-_CH_MINE = SPATIAL_CHANNELS.index("owned_by_viewer")
-_CH_ENEMY = SPATIAL_CHANNELS.index("owned_by_enemy")
+# How far (in tiles) from the clicked tile the engine searches for a shore
+# tile of the clicked tile's owner to land on — SpatialQuery.
+# closestReachableShore's maxDist. Beyond it the boat is refused.
+BOAT_LANDING_RANGE = 50
+
+# Low 12 bits of a tile-state value are its owner's smallID (GameMap.ts).
+_PLAYER_ID_MASK = 0xFFF
+_IS_SHORELINE = SPATIAL_CHANNELS.index("is_shoreline")
+_OWNED_BY_VIEWER = SPATIAL_CHANNELS.index("owned_by_viewer")
+
+# Action types that read at least one of ARGUMENT_HEADS (only these need step 3).
+_TAKES_ARGUMENTS = TILE_TARGET_ACTION_TYPES | PLAYER_TARGET_ACTION_TYPES | AMOUNT_ACTION_TYPES
 
 
 @dataclass
 class Decision:
-    """What the agent chose on one step, for logging."""
+    """What the agent chose on one step, for logging. ``intent`` is ``None``
+    when nothing was sent (noop, or no legal argument existed)."""
 
     action: str
     intent: dict[str, Any] | None
     unit: str | None = None
     target_small_id: int | None = None
     tile: tuple[int, int] | None = None
+    amount: float | None = None
 
 
 @dataclass(frozen=True)
@@ -141,50 +138,71 @@ class EpisodeResult:
     record_path: Path | None = None
 
 
-def _candidates(action: str, legality: LegalityMask) -> list[int]:
-    ids: list[int] = list(getattr(legality, TARGET_CANDIDATES[action]))
-    if action == "attack" and legality.canExpand:
-        ids.append(_EXPAND)
-    return ids
+def player_target_mask(
+    legality: LegalityMask, candidate_ids: np.ndarray, action_type: int
+) -> np.ndarray:
+    """Which of ``candidate_ids`` the agent may target with ``action_type``:
+    training's ``encode_player_target_mask``, tightened for one case.
+    Training leaves ``allianceExtension`` uninformative (every player
+    "legal", since snapshots carry no signal for it); at play time only an
+    existing ally can actually be extended, and those are exactly the
+    breakable alliances."""
+    mask = encode_player_target_mask(legality, candidate_ids, action_type)
+    if ACTION_TYPES[action_type] == "allianceExtension":
+        mask &= np.isin(candidate_ids, legality.breakableAlliancePlayerSmallIDs)
+    return mask
 
 
-def _pick_target(
-    action: str, legality: LegalityMask, tick: TickSnapshot, rng: np.random.Generator
-) -> int | None:
-    """Temporary rule until a target-player head exists. Attack: expand
-    into unclaimed land while there is any, otherwise hit the weakest
-    attackable neighbor (fewest troops). Everything else: a random legal
-    candidate."""
-    candidates = _candidates(action, legality)
-    if not candidates:
-        return None
-    if action == "attack":
-        if _EXPAND in candidates:
-            return _EXPAND
-        troops = {p.smallID: p.troops for p in tick.players}
-        return min(candidates, key=lambda small_id: troops.get(small_id, float("inf")))
-    return int(rng.choice(candidates))
+def has_coast(spatial: np.ndarray) -> bool:
+    """Whether the viewer owns any shoreline. The engine launches boats only
+    from the attacker's own shore (SpatialQuery.closestReachableShore returns
+    nothing for a landlocked player), so without one every boat is refused."""
+    return bool(((spatial[_IS_SHORELINE] > 0) & (spatial[_OWNED_BY_VIEWER] > 0)).any())
 
 
-def _pick_build_tile(
-    unit: str, spatial: np.ndarray, rng: np.random.Generator
-) -> tuple[int, int] | None:
-    """Temporary rule until a tile head exists: a random tile that's at
-    least plausible for the unit. Nukes target enemy land, ports/warships
-    go on the agent's own shoreline, everything else on the agent's own
-    land. The engine still validates placement and silently drops an
-    invalid build."""
-    if unit in _NUKES:
-        allowed = spatial[_CH_ENEMY] > 0
-    else:
-        allowed = (spatial[_CH_MINE] > 0) & (spatial[_CH_LAND] > 0)
-        if unit in _NAVAL:
-            allowed &= spatial[_CH_SHORE] > 0
-    ys, xs = np.nonzero(allowed)
-    if len(xs) == 0:
-        return None
-    index = int(rng.integers(len(xs)))
-    return int(xs[index]), int(ys[index])
+def boat_tile_mask(spatial: np.ndarray, owner_id: np.ndarray) -> np.ndarray:
+    """Play-time boat destinations: training's boat mask (land owned by
+    neither the viewer nor an ally) narrowed to tiles within
+    ``BOAT_LANDING_RANGE`` of a shore tile *of the same owner* — the engine
+    lands on the clicked tile's owner's nearest shore and refuses the boat
+    if there is none in range.
+
+    Grown outward from each owner's shoreline, one tile per step, only into
+    neighboring tiles of that same owner — so it's a subset of what the
+    engine accepts (its search may also cross water or other owners' land),
+    never a superset. ``owner_id`` is the ``(H, W)`` smallID map.
+    """
+    allowed = encode_tile_target_mask(spatial, _ACTION_INDEX["boat"], 0)
+    reach: np.ndarray = allowed & (spatial[_IS_SHORELINE] > 0)
+    same_vertical = owner_id[1:] == owner_id[:-1]
+    same_horizontal = owner_id[:, 1:] == owner_id[:, :-1]
+    for _ in range(BOAT_LANDING_RANGE):
+        grown = reach.copy()
+        grown[1:] |= reach[:-1] & same_vertical
+        grown[:-1] |= reach[1:] & same_vertical
+        grown[:, 1:] |= reach[:, :-1] & same_horizontal
+        grown[:, :-1] |= reach[:, 1:] & same_horizontal
+        grown &= allowed
+        if np.array_equal(grown, reach):
+            break
+        reach = grown
+    return reach
+
+
+def buildable_unit_mask(
+    decoder: ActionDecoder, legality: LegalityMask, spatial: np.ndarray
+) -> np.ndarray:
+    """``unit_type`` mask for ``build_unit``: units the agent can afford
+    (``legality.buildableUnitTypes``) *and* that have at least one legal
+    tile on the map right now. Step 2 uses ``.any()`` of this to decide if
+    ``build_unit`` is choosable at all, step 4 to pick the unit — the same
+    rule in both places, so step 4 can never pick a unit with nowhere to go."""
+    build = _ACTION_INDEX["build_unit"]
+    mask = decoder.encode_unit_type_mask(legality)
+    for unit in np.flatnonzero(mask):
+        if not encode_tile_target_mask(spatial, build, int(unit)).any():
+            mask[unit] = False
+    return mask
 
 
 class PolicyAgent:
@@ -273,7 +291,91 @@ class PolicyAgent:
             )
         return {head: value[0].float().numpy() for head, value in logits.items()}
 
+    def action_type_mask(
+        self,
+        inputs: ModelInputs,
+        legality: LegalityMask,
+        viewer: PlayerScalars,
+        spawn_phase: bool,
+        boats_at_sea: int = 0,
+    ) -> np.ndarray:
+        """Step 2a: which action types the agent may choose right now.
+
+        Starts from the same ``encode_legality_mask`` training's loss used,
+        then also removes every action type that couldn't become a valid
+        intent this step — so the policy's probability is spread only over
+        actions the agent can actually carry out, instead of being wasted on
+        a choice that decodes to nothing:
+
+        - ``UNDECODABLE_ACTIONS``: no head can fill in a required unit ID.
+        - player-target actions with no legal candidate (``player_target_mask``).
+        - ``boat`` with no coast to launch from (``has_coast``), no tile it
+          could land on, or ``boats_at_sea`` already at the engine's cap
+          (``MAX_BOATS_AT_SEA``).
+        - ``build_unit`` when nothing buildable has a legal tile.
+        """
+        if self._decoder is None:
+            raise RuntimeError("action_type_mask() called before reset()")
+        mask = encode_legality_mask(
+            legality, spawn_phase=spawn_phase, viewer_num_tiles_owned=viewer.numTilesOwned
+        )
+        for name in UNDECODABLE_ACTIONS:
+            mask[_ACTION_INDEX[name]] = False
+
+        for name in PLAYER_TARGET_ACTION_TYPES:
+            index = _ACTION_INDEX[name]
+            if mask[index] and not player_target_mask(legality, inputs.candidate_ids, index).any():
+                mask[index] = False
+
+        boat = _ACTION_INDEX["boat"]
+        if mask[boat] and (
+            boats_at_sea >= MAX_BOATS_AT_SEA
+            or not has_coast(inputs.spatial)
+            or not encode_tile_target_mask(inputs.spatial, boat, 0).any()
+        ):
+            mask[boat] = False
+
+        build = _ACTION_INDEX["build_unit"]
+        if mask[build] and not buildable_unit_mask(self._decoder, legality, inputs.spatial).any():
+            mask[build] = False
+        return mask
+
+    def choose_action_type(
+        self, logits: dict[str, np.ndarray], mask: np.ndarray
+    ) -> int | None:
+        """Step 2b: pick the action type (greedy, or sampled at
+        ``temperature``) among ``mask``'s legal ones. ``None`` when nothing is
+        legal — the agent then does nothing this step."""
+        if self._decoder is None:
+            raise RuntimeError("choose_action_type() called before reset()")
+        return self._decoder.mask_choice(logits["action_type"], mask)
+
+    def argument_logits(
+        self, inputs: ModelInputs, first_pass: dict[str, np.ndarray], action_type: int
+    ) -> dict[str, np.ndarray]:
+        """Step 3: the argument heads' logits (``ARGUMENT_HEADS``) conditioned
+        on the action type actually chosen in step 2.
+
+        ``PolicyNetwork`` scores tiles, players and amounts *given* an action
+        — where to send a boat is not where to build a City. With no
+        ``action_type``, the first pass conditioned them on the model's own
+        top action over all types; that is only the right conditioning when
+        step 2 picked that same action (greedy, with the top action legal).
+        Otherwise this runs a second forward pass conditioned on the chosen
+        one. ``unit_type`` is read from the first pass either way — it isn't
+        conditioned on the action.
+        """
+        if int(np.argmax(first_pass["action_type"])) == action_type:
+            source = first_pass
+        else:
+            source = self._run_policy(inputs, action_type=action_type)
+        return {head: source[head] for head in ARGUMENT_HEADS}
+
     def act(self, tick: TickSnapshot, client_id: str = AGENT_CLIENT_ID) -> Decision:
+        """One full decision for ``client_id``: steps 1-4 (see the module
+        docstring). Every argument comes from its head, masked by the same
+        rule training used; if a needed argument has no legal choice the
+        decision is "do nothing" rather than a broken intent."""
         if self._decoder is None or self._header is None:
             raise RuntimeError("act() called before reset()")
         decoder = self._decoder
@@ -281,42 +383,65 @@ class PolicyAgent:
         me = next(p for p in tick.players if p.clientID == client_id)
         legality = tick.legal[client_id]
 
+        # Step 1: everything the model reads.
         inputs = self.build_inputs(tick, me.smallID)
-        spatial = inputs.spatial
         logits = self._run_policy(inputs)
-        action_logits = logits["action_type"]
-        unit_logits = logits["unit_type"]
 
-        mask = encode_legality_mask(
-            legality, spawn_phase=tick.spawnPhase, viewer_num_tiles_owned=me.numTilesOwned
+        # Step 2: the action type.
+        boats_at_sea = sum(
+            1 for u in tick.units if u.ownerSmallID == me.smallID and u.type == "Transport"
         )
-        for name in UNSUPPORTED_ACTIONS:
-            mask[_ACTION_INDEX[name]] = False
-        for name in TARGET_CANDIDATES:
-            if not _candidates(name, legality):
-                mask[_ACTION_INDEX[name]] = False
-
-        action_index = decoder.mask_choice(action_logits, mask)
+        mask = self.action_type_mask(inputs, legality, me, tick.spawnPhase, boats_at_sea)
+        action_index = self.choose_action_type(logits, mask)
         if action_index is None:
             return Decision(action="noop", intent=None)
         action = ACTION_TYPES[action_index]
+        if action == "noop":
+            return Decision(action=action, intent=None)
 
-        unit_index = 0
+        # Step 3: argument logits conditioned on that action (only if it has any).
+        arguments = (
+            self.argument_logits(inputs, logits, action_index)
+            if action in _TAKES_ARGUMENTS
+            else {}
+        )
+
+        # Step 4: each argument from its head.
+        unit_index = UNIT_TYPES.index("none")
         unit: str | None = None
-        tile: tuple[int, int] | None = None
         if action == "build_unit":
-            chosen_unit = decoder.mask_choice(unit_logits, decoder.encode_unit_type_mask(legality))
+            chosen_unit = decoder.mask_choice(
+                logits["unit_type"], buildable_unit_mask(decoder, legality, inputs.spatial)
+            )
             if chosen_unit is None:
                 return Decision(action=action, intent=None)
             unit_index = chosen_unit
             unit = UNIT_TYPES[unit_index]
-            tile = _pick_build_tile(unit, spatial, self.rng)
+
+        tile: tuple[int, int] | None = None
+        if action in TILE_TARGET_ACTION_TYPES:
+            if action == "boat":
+                owner_id = decode_tile_state(self._header, tick) & _PLAYER_ID_MASK
+                tile_mask = boat_tile_mask(inputs.spatial, owner_id)
+            else:
+                tile_mask = encode_tile_target_mask(inputs.spatial, action_index, unit_index)
+            tile = decoder.choose_tile(arguments["tile_target"], tile_mask)
             if tile is None:
                 return Decision(action=action, intent=None, unit=unit)
 
-        target = None
-        if action in TARGET_CANDIDATES:
-            target = _pick_target(action, legality, tick, self.rng)
+        target: int | None = None
+        if action in PLAYER_TARGET_ACTION_TYPES:
+            target = decoder.choose_target_player(
+                arguments["target_player"],
+                inputs.candidate_ids,
+                player_target_mask(legality, inputs.candidate_ids, action_index),
+            )
+            if target is None:
+                return Decision(action=action, intent=None, unit=unit, tile=tile)
+
+        amount: float | None = None
+        if action in AMOUNT_ACTION_TYPES:
+            amount = decoder.choose_amount(arguments["amount"], action_index, me)
 
         encoded = EncodedAction(
             action_type=action_index,
@@ -324,9 +449,17 @@ class PolicyAgent:
             target_x=tile[0] if tile else None,
             target_y=tile[1] if tile else None,
             target_player_small_id=target,
+            amount=amount,
         )
         intent = decoder.decode_action(encoded, tick=tick, viewer_small_id=me.smallID)
-        return Decision(action=action, intent=intent, unit=unit, target_small_id=target, tile=tile)
+        return Decision(
+            action=action,
+            intent=intent,
+            unit=unit,
+            target_small_id=target,
+            tile=tile,
+            amount=amount,
+        )
 
 
 def play_episode(

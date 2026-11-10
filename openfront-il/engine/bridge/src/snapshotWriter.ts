@@ -6,9 +6,9 @@
  */
 import * as fs from "node:fs";
 import { gzipSync } from "node:zlib";
+import { BuildMenus } from "../../openfront-ai/openfront/src/core/game/Game";
 import type {
   Attack,
-  BuildableUnit,
   Game,
   MutableAlliance,
   Player,
@@ -155,10 +155,22 @@ function canExpand(game: Game, player: Player): boolean {
 export function extractLegality(game: Game, player: Player): LegalityMask {
   const others = game.players().filter((p) => p.clientID() !== player.clientID());
 
-  const buildableUnitTypesList: string[] = player
-    .buildableUnits(null)
-    .filter((buildable: BuildableUnit) => buildable.canBuild !== false)
-    .map((buildable: BuildableUnit) => buildable.type);
+  // Not player.buildableUnits(null): the engine only fills in `canBuild` when
+  // given a tile (PlayerImpl.buildableUnits checks `tile !== null` first), so
+  // with null every unit reads as unbuildable and this list was always empty.
+  // This is the tile-free part of the engine's own (private) canBuildUnitType:
+  // not disabled, affordable, alive, and past the spawn phase. Where exactly
+  // a unit can go is the tile mask's job (features/action_encoder.py).
+  const config = game.config();
+  const gold = player.gold();
+  const canBuildAnything = player.isAlive() && !game.inSpawnPhase();
+  const buildableUnitTypesList: string[] = canBuildAnything
+    ? BuildMenus.types.filter(
+        (unitType) =>
+          !config.isUnitDisabled(unitType) &&
+          gold >= game.unitInfo(unitType).cost(game, player),
+      )
+    : [];
 
   return {
     attackablePlayerSmallIDs: others

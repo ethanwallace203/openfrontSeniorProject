@@ -6,7 +6,7 @@ learning_rate: 0.001
 # (2904x1672) with bf16: batch 16 peaks at 13GB, batch 32 runs out of
 # memory. Raise it only if every game in the dataset is a small map.
 batch_size: 4
-epochs: 10
+epochs: 1
 seed: 1337
 checkpoint_dir: checkpoints
 
