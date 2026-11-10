@@ -105,7 +105,7 @@ function createNodeMapLoader(): GameMapLoader {
  * per-game ownership state. Reusing a cached instance across games would
  * silently leak one game's tile ownership into the next.
  */
-async function loadFreshTerrain(map: GameMapType, mapSize: GameMapSize): Promise<TerrainMapData> {
+export async function loadFreshTerrain(map: GameMapType, mapSize: GameMapSize): Promise<TerrainMapData> {
   const mapFiles = createNodeMapLoader().getMapData(map);
   const manifest = await mapFiles.manifest();
 

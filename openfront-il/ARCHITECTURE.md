@@ -129,6 +129,6 @@ training           ──X──▶  evaluation
 
 Arrows marked X must never exist. If a change seems to need one, the
 responsibility is in the wrong layer — restructure instead of adding the
-import. See coding standards in the project root prompt / `pyproject.toml`
+import. See coding standards in the project root prompt / `pyproject.toml` jkn,u ioudgfyj
 lint config for how this is enforced (import-linter style layering checks
 are a natural addition once the layers stabilize).

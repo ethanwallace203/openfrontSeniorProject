@@ -449,7 +449,6 @@ def _compute_loss(
     )
     return action_loss + unit_loss + tile_loss + player_loss, logits
 
-
 def _evaluate(
     policy: PolicyNetwork,
     data_loader: DataLoader[dict[str, Tensor]],
@@ -544,6 +543,9 @@ def train(training_config: TrainingConfig, model_config: ModelConfig) -> Path:
     """
     seed_everything(training_config.seed)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("training on device: %s", device)
+
     game_ids = sorted(path.stem for path in paths.PROCESSED_DIR.glob("*.parquet"))
     if not game_ids:
         raise RuntimeError("no processed games found in data/processed/ — run build_dataset first")
@@ -592,7 +594,6 @@ def train(training_config: TrainingConfig, model_config: ModelConfig) -> Path:
     metadata.training_config = training_config.model_dump()
     metadata.seed = training_config.seed
     optimizer = torch.optim.Adam(policy.parameters(), lr=training_config.learning_rate)
-
     action_type_weight = torch.ones(len(ACTION_TYPES), device=device)
     # Dividing by the keep fraction undoes the subsampling in expectation:
     # each kept noop stands in for 1/keep of them, so the model still

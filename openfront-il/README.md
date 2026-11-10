@@ -52,14 +52,15 @@ methodology this pipeline implements.
 npm install
 git submodule update --init --recursive
 
-# 2. Python side
-pip install -e ".[dev]"
+# 2. Python side (resolves torch against the CUDA wheel index so training
+#    uses a GPU when one is present, falling back to CPU otherwise)
+make install
 
 # 3. Run the pipeline stage by stage (see Makefile for exact targets)
 make fetch          # engine/bridge/src/fetchGame.ts -> data/raw/
 make replay          # engine/bridge/src/replayGame.ts -> data/snapshots/
 make build-dataset   # src/openfront_il/features/dataset_builder.py -> data/processed/
-make train           # src/openfront_il/training/bc_trainer.py -> checkpoint
+           # src/openfront_il/training/bc_trainer.py -> checkpoint
 make eval            # src/openfront_il/evaluation/held_out_report.py -> docs report
 ```
 

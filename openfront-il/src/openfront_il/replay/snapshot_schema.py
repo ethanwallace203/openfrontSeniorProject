@@ -52,10 +52,9 @@ class SnapshotHeader(BaseModel):
 
 class PlayerScalars(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-    # The engine PlayerID: what intent target fields (targetID, recipient,
-    # target, requestor) refer to — never clientID, even for humans. See
-    # types.ts for the full explanation.
+    # The engine's PlayerID — what intents reference players by
+    # (attack.targetID, donate_*.recipient, ...); not the same as clientID.
+    # Optional only so snapshots written before it was recorded still parse.
     id: str
     clientID: str | None
     smallID: int
