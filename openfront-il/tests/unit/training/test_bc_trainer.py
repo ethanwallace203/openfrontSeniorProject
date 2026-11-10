@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from openfront_il.features import dataset_builder
-from openfront_il.features.action_encoder import ACTION_TYPES, UNIT_TYPES
+from openfront_il.features.action_encoder import ACTION_TYPES, AMOUNT_BUCKET_VALUES, UNIT_TYPES
 from openfront_il.features.observation_encoder import (
     FLAT_FEATURES,
     PLAYER_FEATURES,
@@ -62,6 +62,18 @@ class TestCollateExamples:
         assert collated["action_type_legal"].shape == (2, len(ACTION_TYPES))
         assert collated["target_x"].shape == (2,)
         assert collated["target_player"].shape == (2,)
+        assert collated["amount_bucket"].shape == (2,)
+
+    def test_pads_candidate_cells_with_no_owner(self) -> None:
+        batch = [self._item(8, 8), self._item(16, 16)]
+
+        collated = bc_trainer.collate_examples(batch)
+
+        cells = collated["candidate_cells"]
+        assert cells.shape == (2, 4, 4)
+        assert torch.all(cells[0, :2, :2] == 0)
+        assert torch.all(cells[0, 2:, :] == -1)
+        assert torch.all(cells[0, :, 2:] == -1)
 
     def test_pads_tile_legal_with_false(self) -> None:
         batch = [self._item(4, 4), self._item(8, 8)]
@@ -94,6 +106,7 @@ def _item(
     action_type: str = "spawn",
     target_xy: tuple[int, int] = (-1, -1),
     target_player: int = -1,
+    amount_bucket: int = -1,
 ) -> dict[str, torch.Tensor]:
     return {
         "spatial": torch.ones(len(SPATIAL_CHANNELS), height, width),
@@ -105,8 +118,12 @@ def _item(
         "target_y": torch.tensor(target_xy[1], dtype=torch.long),
         "tile_legal": torch.ones(height, width, dtype=torch.bool),
         "player_features": torch.randn(candidates, len(PLAYER_FEATURES)),
+        # _tiny_policy's 2 conv layers downsample by 4; every cell owned by
+        # candidate 0 (terra nullius).
+        "candidate_cells": torch.zeros(height // 4, width // 4, dtype=torch.int16),
         "player_legal": torch.ones(candidates, dtype=torch.bool),
         "target_player": torch.tensor(target_player, dtype=torch.long),
+        "amount_bucket": torch.tensor(amount_bucket, dtype=torch.long),
     }
 
 
@@ -149,10 +166,33 @@ class TestArgumentLosses:
             [_item(16, 16, action_type="noop"), _item(16, 16, action_type="noop")]
         )
 
-        baseline = self._loss(batch, tile_target_loss_weight=0.0, target_player_loss_weight=0.0)
-        weighted = self._loss(batch, tile_target_loss_weight=100.0, target_player_loss_weight=100.0)
+        baseline = self._loss(
+            batch,
+            tile_target_loss_weight=0.0,
+            target_player_loss_weight=0.0,
+            amount_loss_weight=0.0,
+        )
+        weighted = self._loss(
+            batch,
+            tile_target_loss_weight=100.0,
+            target_player_loss_weight=100.0,
+            amount_loss_weight=100.0,
+        )
 
         assert weighted == pytest.approx(baseline)
+
+    def test_amount_loss_applies_to_rows_with_an_amount(self) -> None:
+        batch = bc_trainer.collate_examples(
+            [
+                _item(16, 16, action_type="attack", target_player=1, amount_bucket=5),
+                _item(16, 16, action_type="noop"),
+            ]
+        )
+
+        without = self._loss(batch, amount_loss_weight=0.0)
+        with_amount = self._loss(batch, amount_loss_weight=1.0)
+
+        assert with_amount > without
 
     def test_tile_loss_applies_to_rows_with_a_tile_target(self) -> None:
         batch = bc_trainer.collate_examples(
@@ -440,6 +480,7 @@ class TestBuildModelForConfig:
         assert metadata.policy_network_config.action_type_count == len(ACTION_TYPES)
         assert metadata.policy_network_config.unit_type_count == len(UNIT_TYPES)
         assert metadata.policy_network_config.player_feature_dim == len(PLAYER_FEATURES)
+        assert metadata.policy_network_config.amount_bucket_count == len(AMOUNT_BUCKET_VALUES)
 
         spatial = torch.randn(2, len(SPATIAL_CHANNELS), 16, 16)
         flat = torch.randn(2, len(FLAT_FEATURES))

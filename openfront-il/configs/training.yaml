@@ -20,6 +20,9 @@ unit_type_loss_weight: 1.0
 # argument (see training/bc_trainer.py's module docstring).
 tile_target_loss_weight: 1.0
 target_player_loss_weight: 1.0
+# Troop/gold amount (attack, boat, donate_*), as a fraction-of-what-you-have
+# bucket — see features/action_encoder.py's AMOUNT_BUCKET_EDGES.
+amount_loss_weight: 1.0
 
 # Downweights the "noop" class in the action_type head's cross-entropy —
 # see docs/imitation_learning_plan.md Section 3 for why (noop is expected

@@ -24,7 +24,12 @@ from openfront_il.models.spatial_encoder import SpatialEncoder
 # v2: SpatialEncoder returns its feature map alongside the pooled latent,
 # and PolicyNetwork gained the tile_target / target_player heads (plus
 # PolicyNetworkConfig.player_feature_dim). See docs/rl_handoff.md.
-FORMAT_VERSION = 2
+# v3: PolicyNetwork gained the amount head (PolicyNetworkConfig.
+# amount_bucket_count), target_player's key now also reads each candidate's
+# territory (the feature map averaged over its cells), and the observation
+# grew to 25 spatial channels / 24 flat / 21 player features — a v2
+# checkpoint's weights don't fit.
+FORMAT_VERSION = 3
 
 
 class SpatialEncoderConfig(BaseModel):
@@ -38,6 +43,7 @@ class PolicyNetworkConfig(BaseModel):
     action_type_count: int
     unit_type_count: int
     player_feature_dim: int
+    amount_bucket_count: int
     hidden_dim: int = 128
 
 

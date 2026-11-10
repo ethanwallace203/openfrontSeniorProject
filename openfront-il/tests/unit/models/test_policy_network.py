@@ -5,6 +5,7 @@ from openfront_il.models.policy_network import PolicyNetwork
 from openfront_il.models.spatial_encoder import SpatialEncoder
 
 PLAYER_FEATURE_DIM = 5
+AMOUNT_BUCKET_COUNT = 11
 
 
 def _make_policy(
@@ -17,6 +18,7 @@ def _make_policy(
         action_type_count=action_type_count,
         unit_type_count=unit_type_count,
         player_feature_dim=PLAYER_FEATURE_DIM,
+        amount_bucket_count=AMOUNT_BUCKET_COUNT,
     )
 
 
@@ -37,8 +39,15 @@ class TestPolicyNetwork:
 
         logits = policy(*_inputs(batch_size=4, candidates=3))
 
-        assert set(logits.keys()) == {"action_type", "unit_type", "tile_target", "target_player"}
+        assert set(logits.keys()) == {
+            "action_type",
+            "unit_type",
+            "tile_target",
+            "target_player",
+            "amount",
+        }
         assert logits["action_type"].shape == (4, 19)
+        assert logits["amount"].shape == (4, AMOUNT_BUCKET_COUNT)
         assert logits["unit_type"].shape == (4, 17)
         # conv_channels=(4, 8) -> 1/4 resolution: one logit per feature-map cell.
         assert logits["tile_target"].shape == (4, 4, 4)
@@ -65,6 +74,37 @@ class TestPolicyNetwork:
         assert torch.all(probabilities[:, 2:] == 0.0)
         assert torch.all(torch.isfinite(logits["target_player"]))
 
+    def test_territory_changes_target_player_scores(self) -> None:
+        """Two candidates with identical scalar features: with no cells they
+        score the same; give one of them territory where the map differs and
+        their scores separate — the head now sees *where* each player is."""
+        torch.manual_seed(0)
+        policy = _make_policy()
+        policy.eval()
+        spatial, flat, _, valid = _inputs(batch_size=1, candidates=2)
+        spatial[:, :, :8, :] = 5.0  # make the top half of the map distinct
+        same_features = torch.randn(1, 1, PLAYER_FEATURE_DIM).expand(1, 2, PLAYER_FEATURE_DIM)
+
+        with torch.no_grad():
+            without_cells = policy(spatial, flat, same_features, valid)["target_player"]
+            cells = torch.full((1, 4, 4), -1, dtype=torch.long)
+            cells[:, :2, :] = 0  # candidate 0 owns the distinct top half
+            cells[:, 2:, :] = 1  # candidate 1 owns the bottom half
+            with_cells = policy(spatial, flat, same_features, valid, candidate_cells=cells)[
+                "target_player"
+            ]
+
+        torch.testing.assert_close(without_cells[0, 0], without_cells[0, 1])
+        assert not torch.isclose(with_cells[0, 0], with_cells[0, 1])
+
+    def test_candidate_cells_of_a_different_size_are_aligned(self) -> None:
+        policy = _make_policy()
+        spatial, flat, features, valid = _inputs(batch_size=2, candidates=3)
+        for shape in [(2, 3, 3), (2, 6, 5)]:  # feature map is 4x4
+            cells = torch.zeros(shape, dtype=torch.long)
+            logits = policy(spatial, flat, features, valid, candidate_cells=cells)
+            assert torch.all(torch.isfinite(logits["target_player"]))
+
     def test_argument_heads_are_conditioned_on_action_type(self) -> None:
         policy = _make_policy()
         policy.eval()
@@ -76,6 +116,7 @@ class TestPolicyNetwork:
 
         assert not torch.allclose(as_spawn["tile_target"], as_build["tile_target"])
         assert not torch.allclose(as_spawn["target_player"], as_build["target_player"])
+        assert not torch.allclose(as_spawn["amount"], as_build["amount"])
         # The action_type head itself never depends on the conditioning.
         torch.testing.assert_close(as_spawn["action_type"], as_build["action_type"])
 

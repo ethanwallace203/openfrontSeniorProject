@@ -38,6 +38,7 @@ from openfront_il.features.action_encoder import (
 )
 from openfront_il.features.observation_encoder import (
     FLAT_FEATURES,
+    encode_candidate_cells,
     encode_player_candidates,
     encode_spatial,
 )
@@ -57,8 +58,13 @@ class ExampleTable:
     the open files and each worker reopens its own.
     """
 
-    def __init__(self, game_ids: list[str]) -> None:
+    def __init__(self, game_ids: list[str], *, cell_factor: int = 8) -> None:
+        """``cell_factor`` must match the model's
+        ``SpatialEncoder.downsample_factor`` — it sizes each example's
+        ``candidate_cells`` grid to line up with the feature map. The default
+        is the default 3-layer encoder's factor (2**3)."""
         self.game_ids = game_ids
+        self.cell_factor = cell_factor
         tables = [
             pq.read_table(paths.PROCESSED_DIR / f"{game_id}.parquet").to_pandas()
             for game_id in game_ids
@@ -110,11 +116,16 @@ class ExampleTable:
         - ``target_x`` / ``target_y`` (0-d int64): the tile argument, or
           ``-1`` when this row's action type takes no tile (or its tile
           couldn't be decoded). ``tile_legal`` ``[H, W]`` bool.
+        - ``candidate_cells`` ``[H // cell_factor, W // cell_factor]`` int16:
+          which candidate owns each feature-map cell, ``-1`` for none (see
+          ``observation_encoder.encode_candidate_cells``).
         - ``player_features`` ``[N, P]``, ``player_legal`` ``[N]`` bool,
           and ``target_player`` (0-d int64): the index of the target among
           those ``N`` candidates, or ``-1`` when this row's action type
           takes no player (or the target isn't a candidate, e.g. a player
           who died during the snapshot window).
+        - ``amount_bucket`` (0-d int64): the ``AMOUNT_BUCKET_EDGES`` bucket
+          of this row's troop/gold amount, or ``-1`` when it takes none.
         """
         row = self.rows.iloc[index]
         game_id = row["game_id"]
@@ -136,6 +147,9 @@ class ExampleTable:
             target_x, target_y = int(row["target_x"]), int(row["target_y"])
 
         candidate_ids, player_features = encode_player_candidates(header, tick, small_id)
+        candidate_cells = encode_candidate_cells(
+            header, tick, small_id, candidate_ids, self.cell_factor
+        )
         player_legal = encode_player_target_mask(
             tick.legal[row["client_id"]], candidate_ids, action_type
         )
@@ -144,6 +158,11 @@ class ExampleTable:
             matches = np.flatnonzero(candidate_ids == int(row["target_player_small_id"]))
             if len(matches) > 0:
                 target_player = int(matches[0])
+
+        # A parquet written before the amount head existed has no such
+        # column; treat that as "no label" rather than failing.
+        raw_bucket = row.get("amount_bucket", -1)
+        amount_bucket = -1 if pd.isna(raw_bucket) else int(raw_bucket)
 
         return {
             "spatial": spatial,
@@ -155,6 +174,8 @@ class ExampleTable:
             "target_y": np.int64(target_y),
             "tile_legal": encode_tile_target_mask(spatial, action_type, unit_type),
             "player_features": player_features,
+            "candidate_cells": candidate_cells,
             "player_legal": player_legal,
             "target_player": np.int64(target_player),
+            "amount_bucket": np.int64(amount_bucket),
         }

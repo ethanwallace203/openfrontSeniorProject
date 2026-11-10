@@ -28,7 +28,7 @@ import torch.nn.functional as functional
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from openfront_il.features.action_encoder import ACTION_TYPES, UNIT_TYPES
+from openfront_il.features.action_encoder import ACTION_TYPES, AMOUNT_BUCKET_VALUES, UNIT_TYPES
 from openfront_il.features.example_loader import ExampleTable
 from openfront_il.features.observation_encoder import (
     FLAT_FEATURES,
@@ -96,9 +96,9 @@ class BCDataset(Dataset[dict[str, Tensor]]):
     tradeoffs (shared with ``evaluation/``, which uses the same table).
     """
 
-    def __init__(self, game_ids: list[str]) -> None:
+    def __init__(self, game_ids: list[str], *, cell_factor: int = 8) -> None:
         self.game_ids = game_ids
-        self.table = ExampleTable(game_ids)
+        self.table = ExampleTable(game_ids, cell_factor=cell_factor)
 
     def __len__(self) -> int:
         return len(self.table)
@@ -118,8 +118,10 @@ class BCDataset(Dataset[dict[str, Tensor]]):
             "target_y": torch.tensor(int(example["target_y"]), dtype=torch.long),
             "tile_legal": torch.from_numpy(example["tile_legal"]),
             "player_features": torch.from_numpy(example["player_features"]),
+            "candidate_cells": torch.from_numpy(example["candidate_cells"]),
             "player_legal": torch.from_numpy(example["player_legal"]),
             "target_player": torch.tensor(int(example["target_player"]), dtype=torch.long),
+            "amount_bucket": torch.tensor(int(example["amount_bucket"]), dtype=torch.long),
         }
 
 
@@ -237,8 +239,13 @@ def collate_examples(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     max_height = max(item["spatial"].shape[1] for item in batch)
     max_width = max(item["spatial"].shape[2] for item in batch)
     max_candidates = max(item["player_features"].shape[0] for item in batch)
+    # max(H_i) // f == max(H_i // f), so padding every cell grid to the
+    # batch's largest one matches the feature map of the padded spatial.
+    max_cell_height = max(item["candidate_cells"].shape[0] for item in batch)
+    max_cell_width = max(item["candidate_cells"].shape[1] for item in batch)
 
     padded_spatial = []
+    padded_candidate_cells = []
     padded_tile_legal = []
     padded_player_features = []
     padded_player_legal = []
@@ -250,6 +257,15 @@ def collate_examples(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         padded_spatial.append(functional.pad(spatial, (0, pad_right, 0, pad_bottom)))
         padded_tile_legal.append(
             functional.pad(item["tile_legal"], (0, pad_right, 0, pad_bottom), value=False)
+        )
+
+        cells = item["candidate_cells"].long()
+        padded_candidate_cells.append(
+            functional.pad(
+                cells,
+                (0, max_cell_width - cells.shape[1], 0, max_cell_height - cells.shape[0]),
+                value=-1,
+            )
         )
 
         candidate_count = item["player_features"].shape[0]
@@ -272,9 +288,11 @@ def collate_examples(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         "target_y": torch.stack([item["target_y"] for item in batch]),
         "tile_legal": torch.stack(padded_tile_legal),
         "player_features": torch.stack(padded_player_features),
+        "candidate_cells": torch.stack(padded_candidate_cells),
         "player_legal": torch.stack(padded_player_legal),
         "player_valid": torch.stack(player_valid),
         "target_player": torch.stack([item["target_player"] for item in batch]),
+        "amount_bucket": torch.stack([item["amount_bucket"] for item in batch]),
     }
 
 
@@ -417,6 +435,7 @@ def _compute_loss(
         batch["player_features"],
         batch["player_valid"],
         action_type=batch["action_type"],
+        candidate_cells=batch["candidate_cells"],
     )
     action_loss = (
         masked_cross_entropy(
@@ -447,7 +466,20 @@ def _compute_loss(
         )
         * training_config.target_player_loss_weight
     )
-    return action_loss + unit_loss + tile_loss + player_loss, logits
+
+    # Every amount bucket is always a legal choice, so the "mask" is all
+    # True — _argument_loss is reused for its empty-batch handling.
+    has_amount = batch["amount_bucket"] >= 0
+    amount_logits = logits["amount"][has_amount]
+    amount_loss = (
+        _argument_loss(
+            amount_logits,
+            batch["amount_bucket"][has_amount],
+            torch.ones_like(amount_logits, dtype=torch.bool),
+        )
+        * training_config.amount_loss_weight
+    )
+    return action_loss + unit_loss + tile_loss + player_loss + amount_loss, logits
 
 def _evaluate(
     policy: PolicyNetwork,
@@ -466,6 +498,8 @@ def _evaluate(
     correct_tile = 0
     player_examples = 0
     correct_player = 0
+    amount_examples = 0
+    correct_amount = 0
     with torch.no_grad():
         for cpu_batch in data_loader:
             batch = _to_device(cpu_batch, device)
@@ -491,12 +525,20 @@ def _evaluate(
             correct_player += int(
                 (player_predictions == batch["target_player"][has_player]).sum().item()
             )
+
+            has_amount = batch["amount_bucket"] >= 0
+            amount_examples += int(has_amount.sum().item())
+            amount_predictions = logits["amount"][has_amount].argmax(dim=-1)
+            correct_amount += int(
+                (amount_predictions == batch["amount_bucket"][has_amount]).sum().item()
+            )
     if total_examples == 0:
         return 0.0, {
             "action_type_accuracy": 0.0,
             "unit_type_accuracy": 0.0,
             "tile_target_accuracy": 0.0,
             "target_player_accuracy": 0.0,
+            "amount_accuracy": 0.0,
         }
     return total_loss / total_examples, {
         "action_type_accuracy": correct_action_type / total_examples,
@@ -504,6 +546,7 @@ def _evaluate(
         # Over only the rows that take each argument; 0.0 when there are none.
         "tile_target_accuracy": correct_tile / max(tile_examples, 1),
         "target_player_accuracy": correct_player / max(player_examples, 1),
+        "amount_accuracy": correct_amount / max(amount_examples, 1),
     }
 
 
@@ -523,6 +566,7 @@ def build_model_for_config(model_config: ModelConfig) -> tuple[PolicyNetwork, Ch
         action_type_count=len(ACTION_TYPES),
         unit_type_count=len(UNIT_TYPES),
         player_feature_dim=len(PLAYER_FEATURES),
+        amount_bucket_count=len(AMOUNT_BUCKET_VALUES),
         hidden_dim=model_config.policy_network.hidden_dim,
     )
     metadata = CheckpointMetadata(
@@ -542,9 +586,6 @@ def train(training_config: TrainingConfig, model_config: ModelConfig) -> Path:
         RuntimeError: if ``data/processed/`` has no processed games.
     """
     seed_everything(training_config.seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("training on device: %s", device)
 
     game_ids = sorted(path.stem for path in paths.PROCESSED_DIR.glob("*.parquet"))
     if not game_ids:
@@ -569,13 +610,17 @@ def train(training_config: TrainingConfig, model_config: ModelConfig) -> Path:
         training_config.num_workers,
     )
 
-    train_dataset = BCDataset(train_ids)
+    # Same factor SpatialEncoder.downsample_factor derives (one 2x pool per
+    # conv layer), so each example's candidate_cells grid lines up with the
+    # feature map the model will produce.
+    cell_factor = 2 ** len(model_config.spatial_encoder.conv_channels)
+    train_dataset = BCDataset(train_ids, cell_factor=cell_factor)
     train_loader = _make_loader(
         train_dataset, training_config, shuffle=True, device=device, persistent=True
     )
     val_loader: DataLoader[dict[str, Tensor]] | None = None
     if val_ids:
-        val_dataset = BCDataset(val_ids)
+        val_dataset = BCDataset(val_ids, cell_factor=cell_factor)
         if len(val_dataset) > 0:
             val_loader = _make_loader(
                 val_dataset, training_config, shuffle=False, device=device, persistent=False

@@ -95,9 +95,35 @@ PLAYER_TARGET_ACTION_TYPES = frozenset(
     }
 )
 
-# build_unit's `tile` is the nuke's *target* for these, so anywhere is a
-# valid cell — not just the builder's own territory.
+# build_unit's `tile` is the nuke's *target* for these, so it's any tile
+# but the builder's own — not their territory like other structures.
 _NUKE_UNIT_TYPES = frozenset({"Atom Bomb", "Hydrogen Bomb", "MIRV"})
+
+# How far (Manhattan tiles) the engine searches from a Port click for a
+# shore tile the builder owns — Config.radiusPortSpawn() in the engine.
+PORT_SHORE_RADIUS = 20
+
+# Action types whose intent carries an amount the `amount` head predicts:
+# troops for attack/boat/donate_troops, gold for donate_gold.
+AMOUNT_ACTION_TYPES = frozenset({"attack", "boat", "donate_troops", "donate_gold"})
+
+# The amount head predicts a *fraction* of what the viewer has (troops, or
+# gold for donate_gold), not a raw count — raw counts range over five
+# orders of magnitude across a game and don't transfer between games, a
+# fraction does. Buckets are narrow around the 20-30% peak and wide in the
+# tail because that's where real players are: measured over ~4,700 attacks
+# and boats, the median is 0.245 and 57% of attacks fall in 0.20-0.30 (the
+# in-game attack-ratio slider's default region).
+#
+# AMOUNT_BUCKET_EDGES are the upper edges of every bucket but the last;
+# fraction f falls in bucket searchsorted(EDGES, f, side="right"), so the
+# last bucket is "≥ 0.75" — including fractions above 1.0, which happen
+# (~5%) because troops change within the snapshot window.
+AMOUNT_BUCKET_EDGES = (0.05, 0.10, 0.15, 0.20, 0.23, 0.26, 0.30, 0.40, 0.50, 0.75)
+# The fraction each bucket decodes back to at inference: the bucket's
+# midpoint, and 1.0 ("everything") for the open-ended top bucket.
+AMOUNT_BUCKET_VALUES = (0.025, 0.075, 0.125, 0.175, 0.215, 0.245, 0.28, 0.35, 0.45, 0.625, 1.0)
+assert len(AMOUNT_BUCKET_VALUES) == len(AMOUNT_BUCKET_EDGES) + 1
 
 # Real intent types excluded from the modeled action space entirely (see
 # docs/imitation_learning_plan.md Section 2). An intent of one of these
@@ -132,6 +158,36 @@ class EncodedAction:
 NOOP_ACTION = EncodedAction(
     action_type=_ACTION_TYPE_INDEX["noop"], unit_type=_UNIT_TYPE_INDEX["none"]
 )
+
+
+def _amount_basis(action_name: str, viewer_troops: float, viewer_gold: float) -> float:
+    """What an amount is a fraction of: gold for donate_gold, else troops."""
+    return viewer_gold if action_name == "donate_gold" else viewer_troops
+
+
+def encode_amount_bucket(
+    action_type: int, amount: float | None, *, viewer_troops: float, viewer_gold: float
+) -> int:
+    """The ``amount`` head's label: which ``AMOUNT_BUCKET_EDGES`` bucket
+    ``amount`` falls in, as a fraction of what the viewer had. ``-1`` (no
+    label) when the action type takes no amount, the intent didn't carry
+    one, or the viewer had nothing to take a fraction of."""
+    action_name = ACTION_TYPES[action_type]
+    if action_name not in AMOUNT_ACTION_TYPES or amount is None:
+        return -1
+    basis = _amount_basis(action_name, viewer_troops, viewer_gold)
+    if basis <= 0:
+        return -1
+    return int(np.searchsorted(AMOUNT_BUCKET_EDGES, amount / basis, side="right"))
+
+
+def decode_amount_bucket(
+    action_type: int, bucket: int, *, viewer_troops: float, viewer_gold: float
+) -> float:
+    """Inverse of ``encode_amount_bucket`` for inference: the absolute
+    troops (or gold) to put in the intent."""
+    action_name = ACTION_TYPES[action_type]
+    return AMOUNT_BUCKET_VALUES[bucket] * _amount_basis(action_name, viewer_troops, viewer_gold)
 
 
 def _as_float(value: object) -> float | None:
@@ -281,10 +337,13 @@ def encode_tile_target_mask(spatial: np.ndarray, action_type: int, unit_type: in
     an ``encode_spatial()`` tensor. All ``False`` for an action type not in
     ``TILE_TARGET_ACTION_TYPES``.
 
-    Deliberately coarse — a necessary condition, not the engine's full
-    rule (no build-spacing, port-adjacency or range checks): spawn on
-    unowned land, build on your own territory (nukes: anywhere; Warship:
-    water), boat to land you don't own, warships to water.
+    Each rule mirrors what the engine does with the clicked tile (see the
+    per-branch comments): spawn on unowned land; build on your own
+    territory (Port: within ``PORT_SHORE_RADIUS`` of your own coast;
+    nukes: anywhere but your own territory; Warship: water); boat to land
+    owned by neither you nor an ally; warships to water. Still a necessary
+    condition, not the full rule — no build-spacing, silo-range or
+    water-connectivity checks.
     Training still never masks out the true label (see
     ``training/bc_trainer.py``'s ``masked_cross_entropy``), so a rule
     that's too strict costs probability mass, never a ``NaN``.
@@ -293,26 +352,55 @@ def encode_tile_target_mask(spatial: np.ndarray, action_type: int, unit_type: in
         name: np.asarray(spatial[index] > 0) for index, name in enumerate(SPATIAL_CHANNELS)
     }
     is_land = channel["is_land"]
-    is_owned: np.ndarray = (
-        channel["owned_by_viewer"] | channel["owned_by_ally"] | channel["owned_by_enemy"]
-    )
+    mine = channel["owned_by_viewer"]
+    ally = channel["owned_by_ally"]
+    is_owned: np.ndarray = mine | ally | channel["owned_by_enemy"]
     not_land: np.ndarray = ~is_land
     name = ACTION_TYPES[action_type]
 
     if name == "spawn":
         return np.asarray(is_land & ~is_owned)
     if name == "boat":
-        return np.asarray(is_land & ~channel["owned_by_viewer"])
+        # The engine lands on the clicked tile's *owner's* nearest reachable
+        # shore (TransportShipUtils.targetTransportTile), so the click can
+        # be anywhere inland in their territory — not only on the coast.
+        # Allies are excluded: the boat would be refused (canAttackPlayer).
+        return np.asarray(is_land & ~mine & ~ally)
     if name == "move_warship":
         return not_land
     if name == "build_unit":
         unit_name = UNIT_TYPES[unit_type]
         if unit_name in _NUKE_UNIT_TYPES:
-            return np.ones_like(is_land)
+            # A nuke's tile is its target: anywhere but your own territory.
+            return np.asarray(~mine)
         if unit_name == "Warship":
             return not_land
-        return channel["owned_by_viewer"]
+        if unit_name == "Port":
+            # The engine searches PORT_SHORE_RADIUS (Manhattan) around the
+            # click for a shore tile you own (PlayerImpl.portSpawn), so only
+            # your territory within reach of your own coast can work.
+            return np.asarray(
+                mine & _within_manhattan(mine & channel["is_shoreline"], PORT_SHORE_RADIUS)
+            )
+        return mine
     return np.zeros_like(is_land)
+
+
+def _within_manhattan(mask: np.ndarray, radius: int) -> np.ndarray:
+    """``mask`` grown by ``radius`` tiles in Manhattan distance: one
+    4-neighbor dilation step per tile of radius. No scipy dependency, and a
+    few milliseconds even on a 1000x1000 map."""
+    grown = mask.copy()
+    for _ in range(radius):
+        if grown.all():
+            break
+        step = grown.copy()
+        step[1:] |= grown[:-1]
+        step[:-1] |= grown[1:]
+        step[:, 1:] |= grown[:, :-1]
+        step[:, :-1] |= grown[:, 1:]
+        grown = step
+    return grown
 
 
 def encode_player_target_mask(

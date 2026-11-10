@@ -28,7 +28,11 @@ def _metadata(**overrides: object) -> CheckpointMetadata:
             in_channels=7, latent_dim=16, conv_channels=(4, 8)
         ),
         policy_network_config=PolicyNetworkConfig(
-            flat_dim=12, action_type_count=19, unit_type_count=17, player_feature_dim=5
+            flat_dim=12,
+            action_type_count=19,
+            unit_type_count=17,
+            player_feature_dim=5,
+            amount_bucket_count=11,
         ),
         training_config={"lr": 1e-3, "epochs": 5},
         seed=1337,
@@ -78,7 +82,7 @@ class TestSaveAndLoadCheckpoint:
         with torch.no_grad():
             reloaded_logits = loaded_policy(*inputs)
 
-        for head in ("action_type", "unit_type", "tile_target", "target_player"):
+        for head in ("action_type", "unit_type", "tile_target", "target_player", "amount"):
             torch.testing.assert_close(original_logits[head], reloaded_logits[head])
 
     def test_format_version_mismatch_raises(self, tmp_path: Path) -> None:
@@ -100,8 +104,8 @@ class TestSaveAndLoadCheckpoint:
 
 
 class TestFormatVersion:
-    def test_is_2_for_the_argument_heads(self) -> None:
-        """v1 checkpoints have no tile_target/target_player heads — bumping
-        this is what makes load_checkpoint refuse them instead of failing
-        on a missing state-dict key."""
-        assert FORMAT_VERSION == 2
+    def test_is_3_for_the_amount_head(self) -> None:
+        """v2 checkpoints have no amount head and fewer input features —
+        bumping this is what makes load_checkpoint refuse them instead of
+        failing on a missing state-dict key or a shape mismatch."""
+        assert FORMAT_VERSION == 3

@@ -24,6 +24,7 @@ class TrainingConfig(BaseModel):
     unit_type_loss_weight: float = 1.0
     tile_target_loss_weight: float = 1.0
     target_player_loss_weight: float = 1.0
+    amount_loss_weight: float = 1.0
     noop_downweight: float = 1.0
     # Fraction of noop examples kept each epoch (all real actions are
     # always kept). Kept noops are re-weighted by 1 / this in the loss, so

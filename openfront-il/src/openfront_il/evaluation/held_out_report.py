@@ -92,7 +92,7 @@ def run_inference(
     """
     policy, metadata = load_checkpoint(checkpoint_path)
     policy.eval()
-    table = ExampleTable(game_ids)
+    table = ExampleTable(game_ids, cell_factor=policy.spatial_encoder.downsample_factor)
 
     action_type_predictions: list[int] = []
     action_type_labels: list[int] = []
@@ -112,7 +112,15 @@ def run_inference(
             player_features = torch.from_numpy(example["player_features"]).unsqueeze(0)
             player_valid = torch.ones(player_features.shape[:2], dtype=torch.bool)
             action_type = torch.tensor([int(example["action_type"])])
-            logits = policy(spatial, flat, player_features, player_valid, action_type=action_type)
+            candidate_cells = torch.from_numpy(example["candidate_cells"]).long().unsqueeze(0)
+            logits = policy(
+                spatial,
+                flat,
+                player_features,
+                player_valid,
+                action_type=action_type,
+                candidate_cells=candidate_cells,
+            )
 
             if int(example["target_x"]) >= 0:
                 encoder = policy.spatial_encoder

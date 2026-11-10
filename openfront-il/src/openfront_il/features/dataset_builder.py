@@ -24,7 +24,11 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from openfront_il.features.action_encoder import encode_action, encode_legality_mask
+from openfront_il.features.action_encoder import (
+    encode_action,
+    encode_amount_bucket,
+    encode_legality_mask,
+)
 from openfront_il.features.observation_encoder import FLAT_FEATURES, encode_flat
 from openfront_il.replay import loader
 from openfront_il.replay.snapshot_schema import SnapshotHeader, TickSnapshot
@@ -116,6 +120,15 @@ def build_rows_for_tick(
                     "target_x": action.target_x,
                     "target_y": action.target_y,
                     "amount": action.amount,
+                    # Relative to what the viewer had at this snapshot, so
+                    # it's computed here, where the viewer's troops/gold
+                    # are at hand — see encode_amount_bucket.
+                    "amount_bucket": encode_amount_bucket(
+                        action.action_type,
+                        action.amount,
+                        viewer_troops=player.troops,
+                        viewer_gold=float(player.gold),
+                    ),
                     "legality_mask": mask.tolist(),
                 }
             )

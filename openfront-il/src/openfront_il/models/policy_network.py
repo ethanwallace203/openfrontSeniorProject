@@ -46,7 +46,8 @@ class PolicyNetwork(nn.Module):
     """``(spatial [B, C, H, W], flat [B, F], player_features [B, N, P],
     player_valid [B, N], action_type [B] | None) -> {"action_type": [B,
     action_type_count], "unit_type": [B, unit_type_count], "tile_target":
-    [B, H', W'], "target_player": [B, N]}`` logits.
+    [B, H', W'], "target_player": [B, N], "amount": [B,
+    amount_bucket_count]}`` logits.
     """
 
     def __init__(
@@ -56,6 +57,7 @@ class PolicyNetwork(nn.Module):
         action_type_count: int,
         unit_type_count: int,
         player_feature_dim: int,
+        amount_bucket_count: int,
         hidden_dim: int = 128,
     ) -> None:
         super().__init__()
@@ -64,6 +66,7 @@ class PolicyNetwork(nn.Module):
         self.action_type_count = action_type_count
         self.unit_type_count = unit_type_count
         self.player_feature_dim = player_feature_dim
+        self.amount_bucket_count = amount_bucket_count
         self.hidden_dim = hidden_dim
 
         self.trunk = nn.Sequential(
@@ -76,12 +79,20 @@ class PolicyNetwork(nn.Module):
         self.action_type_embedding = nn.Embedding(action_type_count, hidden_dim)
         self.tile_key = nn.Conv2d(spatial_encoder.feature_channels, hidden_dim, kernel_size=1)
         self.tile_query = nn.Linear(hidden_dim, hidden_dim)
+        # Each candidate's key reads its scalar features *and* the feature map
+        # averaged over the cells it owns (see _territory_features), so the
+        # head can tell two players with identical numbers apart by what
+        # their territory actually looks like.
         self.player_key = nn.Sequential(
-            nn.Linear(player_feature_dim, hidden_dim),
+            nn.Linear(player_feature_dim + spatial_encoder.feature_channels, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.player_query = nn.Linear(hidden_dim, hidden_dim)
+        # Reads the action-conditioned context like the two pointer heads:
+        # how much to commit depends on what's being done (a boat vs. an
+        # attack vs. a donation).
+        self.amount_head = nn.Linear(hidden_dim, amount_bucket_count)
 
     def forward(
         self,
@@ -90,7 +101,13 @@ class PolicyNetwork(nn.Module):
         player_features: Tensor,
         player_valid: Tensor,
         action_type: Tensor | None = None,
+        candidate_cells: Tensor | None = None,
     ) -> dict[str, Tensor]:
+        """``candidate_cells`` ``[B, H', W']`` (long): which candidate owns
+        each feature-map cell, ``-1`` for none — from
+        ``observation_encoder.encode_candidate_cells``. Omitted, every
+        candidate's territory features are zero (the head then scores on
+        scalar features alone)."""
         if flat.dim() != 2 or flat.shape[1] != self.flat_dim:
             raise ValueError(f"expected flat shape [B, {self.flat_dim}], got {tuple(flat.shape)}")
         if player_features.dim() != 3 or player_features.shape[2] != self.player_feature_dim:
@@ -116,7 +133,10 @@ class PolicyNetwork(nn.Module):
         tile_keys = self.tile_key(feature_map)
         tile_logits = torch.einsum("bdhw,bd->bhw", tile_keys, self.tile_query(context)) * scale
 
-        player_keys = self.player_key(player_features)
+        territory = self._territory_features(feature_map, candidate_cells, player_features.shape[1])
+        player_keys = self.player_key(
+            torch.cat([player_features, territory.to(player_features.dtype)], dim=-1)
+        )
         player_logits = torch.einsum("bnd,bd->bn", player_keys, self.player_query(context)) * scale
         player_logits = player_logits.masked_fill(
             ~player_valid, torch.finfo(player_logits.dtype).min
@@ -127,4 +147,36 @@ class PolicyNetwork(nn.Module):
             "unit_type": self.unit_type_head(hidden),
             "tile_target": tile_logits,
             "target_player": player_logits,
+            "amount": self.amount_head(context),
         }
+
+    def _territory_features(
+        self, feature_map: Tensor, candidate_cells: Tensor | None, candidate_count: int
+    ) -> Tensor:
+        """``[B, N, feature_channels]``: the mean of ``feature_map`` over each
+        candidate's cells (zero for a candidate owning no cell, or when
+        ``candidate_cells`` is omitted). One ``scatter_add`` over the cells,
+        so the cost doesn't grow with the number of candidates."""
+        batch, channels, cell_height, cell_width = feature_map.shape
+        territory = feature_map.new_zeros(batch, candidate_count, channels, dtype=torch.float32)
+        if candidate_cells is None or candidate_count == 0:
+            return territory
+
+        # Padded batches can leave the cell grid a different size than the
+        # feature map; align it (extra cells are dropped, missing ones are
+        # "no owner").
+        cells = candidate_cells[:, :cell_height, :cell_width].long()
+        missing_rows = cell_height - cells.shape[1]
+        missing_columns = cell_width - cells.shape[2]
+        if missing_rows > 0 or missing_columns > 0:
+            cells = torch.nn.functional.pad(cells, (0, missing_columns, 0, missing_rows), value=-1)
+
+        owner = cells.flatten(1)  # [B, H'*W']
+        owned = (owner >= 0) & (owner < candidate_count)
+        index = owner.clamp(0, max(candidate_count - 1, 0))
+        # float32 for the sums even under autocast: summing many bf16 cells loses precision.
+        values = feature_map.flatten(2).transpose(1, 2).float() * owned.unsqueeze(-1)
+        territory.scatter_add_(1, index.unsqueeze(-1).expand(-1, -1, channels), values)
+        counts = feature_map.new_zeros(batch, candidate_count, dtype=torch.float32)
+        counts.scatter_add_(1, index, owned.float())
+        return territory / counts.clamp(min=1.0).unsqueeze(-1)

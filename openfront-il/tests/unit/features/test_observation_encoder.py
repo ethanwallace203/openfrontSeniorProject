@@ -9,6 +9,7 @@ from openfront_il.features.observation_encoder import (
     PLAYER_FEATURES,
     SPATIAL_CHANNELS,
     TERRA_NULLIUS_SMALL_ID,
+    encode_candidate_cells,
     encode_flat,
     encode_observation,
     encode_player_candidates,
@@ -322,6 +323,257 @@ class TestEncodePlayerCandidates:
         tick = _make_tick([0], players=[_player(2)])
         with pytest.raises(ValueError, match="no player"):
             encode_player_candidates(header, tick, viewer_small_id=1)
+
+
+def _unit(
+    unit_type: str,
+    owner: int,
+    x: int,
+    y: int = 0,
+    *,
+    target: tuple[int, int] | None = None,
+) -> UnitSnapshot:
+    return UnitSnapshot(
+        id=hash((unit_type, owner, x, y)) & 0xFFFF,
+        type=unit_type,
+        ownerSmallID=owner,
+        x=x,
+        y=y,
+        targetX=target[0] if target else None,
+        targetY=target[1] if target else None,
+        health=100,
+        maxHealth=100,
+        troops=0,
+        level=1,
+        isUnderConstruction=False,
+    )
+
+
+def _attack(attacker: int, target: int, troops: float) -> AttackSnapshot:
+    return AttackSnapshot(
+        id=f"{attacker}->{target}",
+        attackerSmallID=attacker,
+        targetSmallID=target,
+        troops=troops,
+        retreating=False,
+        sourceX=None,
+        sourceY=None,
+    )
+
+
+class TestSituationalAwareness:
+    """The v3 features: where other players are, how strong they are, what
+    they've built, and the attacks in progress.
+
+    A 1x5 all-land strip owned [unowned, viewer(1), enemy(2), ally(3),
+    enemy(4)]. The viewer has 100 troops; player 2 has 1000 (stronger), 3
+    has 100 (similar), 4 has 10 (weaker)."""
+
+    def _header(self) -> SnapshotHeader:
+        return _make_header([LAND] * 5, width=5, height=1)
+
+    def _tick(self, **overrides: object) -> TickSnapshot:
+        tick = _make_tick(
+            [0, 1, 2, 3, 4],
+            players=[
+                _player(1, troops=100.0, numTilesOwned=1),
+                _player(2, troops=1000.0, numTilesOwned=1, type="NATION", clientID=None),
+                _player(3, troops=100.0, numTilesOwned=1),
+                _player(4, troops=10.0, numTilesOwned=1, type="BOT", clientID=None),
+            ],
+            alliances=[AllianceSnapshot(requestorSmallID=1, recipientSmallID=3, expiresAtTick=999)],
+        )
+        return tick.model_copy(update=overrides)
+
+    def _channel(self, tick: TickSnapshot, name: str) -> list[int]:
+        spatial = encode_spatial(self._header(), tick, viewer_small_id=1)
+        return spatial[SPATIAL_CHANNELS.index(name)].flatten().tolist()
+
+    # -- spatial -----------------------------------------------------------
+
+    def test_every_channel_is_binary_uint8(self) -> None:
+        tick = self._tick(
+            units=[_unit("City", 1, 1), _unit("Atom Bomb", 2, 2, target=(1, 0))],
+            attacks=[_attack(2, 1, 50.0)],
+        )
+        spatial = encode_spatial(self._header(), tick, viewer_small_id=1)
+
+        assert spatial.dtype == np.uint8
+        assert spatial.shape == (len(SPATIAL_CHANNELS), 1, 5)
+        assert set(np.unique(spatial)) <= {0, 1}
+
+    def test_owner_strength_buckets(self) -> None:
+        tick = self._tick()
+
+        assert self._channel(tick, "owner_stronger") == [0, 0, 1, 0, 0]
+        assert self._channel(tick, "owner_similar") == [0, 0, 0, 1, 0]
+        assert self._channel(tick, "owner_weaker") == [0, 0, 0, 0, 1]
+
+    def test_viewer_and_unowned_land_get_no_strength(self) -> None:
+        tick = self._tick()
+        for name in ("owner_stronger", "owner_similar", "owner_weaker"):
+            values = self._channel(tick, name)
+            assert values[0] == 0 and values[1] == 0
+
+    def test_attack_channels_mark_territory_not_unowned_land(self) -> None:
+        tick = self._tick(
+            attacks=[_attack(2, 1, 50.0), _attack(1, 4, 20.0), _attack(1, 0, 30.0)]
+        )
+
+        assert self._channel(tick, "owner_attacking_viewer") == [0, 0, 1, 0, 0]
+        # Expanding into unowned land (target 0) doesn't mark anything.
+        assert self._channel(tick, "owner_attacked_by_viewer") == [0, 0, 0, 0, 1]
+
+    def test_unit_channels(self) -> None:
+        tick = self._tick(
+            units=[
+                _unit("City", 1, 1),
+                _unit("Transport", 1, 1),
+                _unit("SAM Launcher", 2, 2),
+                _unit("Port", 3, 3),  # ally: not an enemy structure
+                _unit("Warship", 4, 4),
+                _unit("Hydrogen Bomb", 2, 2, target=(1, 0)),
+                _unit("Trade Ship", 2, 2),  # ignored entirely
+            ]
+        )
+
+        assert self._channel(tick, "own_city") == [0, 1, 0, 0, 0]
+        assert self._channel(tick, "own_port") == [0, 0, 0, 0, 0]
+        assert self._channel(tick, "own_transport") == [0, 1, 0, 0, 0]
+        assert self._channel(tick, "enemy_structure") == [0, 0, 1, 0, 0]
+        assert self._channel(tick, "enemy_sam_launcher") == [0, 0, 1, 0, 0]
+        assert self._channel(tick, "enemy_warship") == [0, 0, 0, 0, 1]
+        assert self._channel(tick, "incoming_nuke_target") == [0, 1, 0, 0, 0]
+
+    # -- flat ----------------------------------------------------------------
+
+    def test_flat_attack_and_threat_totals(self) -> None:
+        tick = self._tick(
+            attacks=[_attack(2, 1, 50.0), _attack(4, 1, 30.0), _attack(1, 0, 70.0)],
+            units=[
+                _unit("Transport", 2, 2),
+                _unit("Transport", 3, 3),  # ally boat: not a threat
+                _unit("Atom Bomb", 4, 4, target=(1, 0)),
+            ],
+        )
+        values = dict(zip(FLAT_FEATURES, encode_flat(tick, viewer_small_id=1), strict=True))
+
+        assert values["incoming_attack_troops_log1p"] == pytest.approx(np.log1p(80.0))
+        assert values["outgoing_attack_troops_log1p"] == pytest.approx(np.log1p(70.0))
+        assert values["num_incoming_attacks"] == 2.0
+        assert values["enemy_transports_log1p"] == pytest.approx(np.log1p(1))
+        assert values["enemy_nukes_in_flight"] == 1.0
+
+    def test_flat_own_structure_counts(self) -> None:
+        tick = self._tick(
+            units=[_unit("City", 1, 1), _unit("City", 1, 1), _unit("Port", 2, 2)]
+        )
+        values = dict(zip(FLAT_FEATURES, encode_flat(tick, viewer_small_id=1), strict=True))
+
+        assert values["own_city_count_log1p"] == pytest.approx(np.log1p(2))
+        assert values["own_port_count_log1p"] == 0.0  # the Port belongs to player 2
+
+    # -- player candidates ---------------------------------------------------
+
+    def _player_features(self, tick: TickSnapshot) -> dict[int, dict[str, float]]:
+        small_ids, features = encode_player_candidates(self._header(), tick, viewer_small_id=1)
+        return {
+            int(small_id): dict(zip(PLAYER_FEATURES, row.tolist(), strict=True))
+            for small_id, row in zip(small_ids, features, strict=True)
+        }
+
+    def test_player_attack_troops_both_directions(self) -> None:
+        tick = self._tick(attacks=[_attack(2, 1, 50.0), _attack(1, 2, 20.0), _attack(1, 0, 9.0)])
+        by_id = self._player_features(tick)
+
+        assert by_id[2]["incoming_attack_troops_log1p"] == pytest.approx(np.log1p(50.0))
+        assert by_id[2]["outgoing_attack_troops_log1p"] == pytest.approx(np.log1p(20.0))
+        assert by_id[0]["outgoing_attack_troops_log1p"] == pytest.approx(np.log1p(9.0))
+        assert by_id[4]["incoming_attack_troops_log1p"] == 0.0
+
+    def test_centroids_are_relative_to_viewer_and_scaled_by_map_size(self) -> None:
+        by_id = self._player_features(self._tick())
+
+        # Viewer at x=1; player 2 at x=2, player 4 at x=4; map width 5.
+        assert by_id[2]["centroid_dx"] == pytest.approx(1 / 5)
+        assert by_id[4]["centroid_dx"] == pytest.approx(3 / 5)
+        assert by_id[4]["centroid_distance"] == pytest.approx(3 / 5)
+        assert by_id[2]["centroid_dy"] == 0.0
+        # Terra nullius: the center of unowned land (x=0), left of the viewer.
+        assert by_id[0]["centroid_dx"] == pytest.approx(-1 / 5)
+
+    def test_player_type_and_structures(self) -> None:
+        tick = self._tick(
+            units=[_unit("City", 2, 2), _unit("SAM Launcher", 2, 2), _unit("Warship", 4, 4)]
+        )
+        by_id = self._player_features(tick)
+
+        assert by_id[2]["is_nation"] == 1.0 and by_id[2]["is_bot"] == 0.0
+        assert by_id[4]["is_bot"] == 1.0 and by_id[4]["is_nation"] == 0.0
+        assert by_id[2]["structure_count_log1p"] == pytest.approx(np.log1p(2))
+        assert by_id[2]["has_sam_launcher"] == 1.0
+        # Warships aren't structures.
+        assert by_id[4]["structure_count_log1p"] == 0.0
+
+    def test_troops_per_tile(self) -> None:
+        by_id = self._player_features(self._tick())
+
+        assert by_id[2]["troops_per_tile_log1p"] == pytest.approx(np.log1p(1000.0))
+
+
+class TestEncodeCandidateCells:
+    """An 8x8 all-land map with cell_factor 4 -> a 2x2 cell grid. Owners are
+    painted per test; candidates are [terra nullius, 2, 3] (viewer is 1)."""
+
+    CANDIDATES = np.array([TERRA_NULLIUS_SMALL_ID, 2, 3], dtype=np.int64)
+
+    def _cells(self, owners: np.ndarray, *, land: np.ndarray | None = None) -> list[list[int]]:
+        height, width = owners.shape
+        is_land = land if land is not None else np.ones_like(owners, dtype=bool)
+        terrain = np.where(is_land, LAND, 0).astype(np.uint8)
+        header = _make_header(terrain.flatten().tolist(), width=width, height=height)
+        tick = _make_tick(
+            owners.flatten().tolist(), players=[_player(1), _player(2), _player(3)]
+        )
+        cells = encode_candidate_cells(header, tick, 1, self.CANDIDATES, cell_factor=4)
+        assert cells.dtype == np.int16
+        return cells.tolist()
+
+    def test_each_cell_belongs_to_its_majority_owner(self) -> None:
+        owners = np.zeros((8, 8), dtype=np.int64)
+        owners[:4, :4] = 2  # top-left: player 2 -> candidate index 1
+        owners[4:, 4:] = 3  # bottom-right: player 3 -> candidate index 2
+        # top-right and bottom-left stay unowned land -> candidate 0
+
+        assert self._cells(owners) == [[1, 0], [0, 2]]
+
+    def test_viewer_tiles_dont_decide_a_cell(self) -> None:
+        """A front-line cell that's mostly the viewer's belongs to the
+        neighbor in it, not to the viewer (who isn't a candidate)."""
+        owners = np.zeros((8, 8), dtype=np.int64)
+        owners[:4, :4] = 1  # top-left cell: all viewer...
+        owners[0, 0] = 2  # ...except one tile of player 2
+        assert self._cells(owners)[0][0] == 1
+
+    def test_water_doesnt_decide_a_cell(self) -> None:
+        owners = np.zeros((8, 8), dtype=np.int64)
+        land = np.zeros((8, 8), dtype=bool)
+        land[0, 0] = True  # top-left cell: one land tile, owned by player 3
+        owners[0, 0] = 3
+        cells = self._cells(owners, land=land)
+        assert cells[0][0] == 2
+        # Cells with no land at all have no owner.
+        assert cells[1][1] == -1
+
+    def test_cell_of_only_viewer_land_has_no_owner(self) -> None:
+        owners = np.ones((8, 8), dtype=np.int64)
+        assert self._cells(owners) == [[-1, -1], [-1, -1]]
+
+    def test_grid_floors_like_the_conv_trunk(self) -> None:
+        header = _make_header([LAND] * (9 * 10), width=10, height=9)
+        tick = _make_tick([0] * (9 * 10), players=[_player(1)])
+        cells = encode_candidate_cells(header, tick, 1, self.CANDIDATES, cell_factor=4)
+        assert cells.shape == (2, 2)
 
 
 class TestEncodeObservation:

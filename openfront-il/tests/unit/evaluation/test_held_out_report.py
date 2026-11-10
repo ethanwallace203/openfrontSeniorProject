@@ -5,7 +5,7 @@ import pytest
 
 from openfront_il.evaluation import held_out_report
 from openfront_il.features import dataset_builder
-from openfront_il.features.action_encoder import ACTION_TYPES, UNIT_TYPES
+from openfront_il.features.action_encoder import ACTION_TYPES, AMOUNT_BUCKET_VALUES, UNIT_TYPES
 from openfront_il.models.checkpoint_format import (
     FORMAT_VERSION,
     CheckpointMetadata,
@@ -45,6 +45,7 @@ def _tiny_checkpoint(tmp_path: Path) -> Path:
             action_type_count=len(ACTION_TYPES),
             unit_type_count=len(UNIT_TYPES),
             player_feature_dim=len(PLAYER_FEATURES),
+            amount_bucket_count=len(AMOUNT_BUCKET_VALUES),
             hidden_dim=8,
         ),
     )

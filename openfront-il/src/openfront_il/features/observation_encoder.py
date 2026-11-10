@@ -27,7 +27,7 @@ import gzip
 
 import numpy as np
 
-from openfront_il.replay.snapshot_schema import SnapshotHeader, TickSnapshot
+from openfront_il.replay.snapshot_schema import SnapshotHeader, TickSnapshot, UnitSnapshot
 
 # Terrain byte bit layout — engine/openfront-ai/openfront/src/core/game/GameMap.ts
 _IS_LAND_BIT = 7
@@ -41,10 +41,32 @@ _DEFENSE_BONUS_BIT = 14
 # TerraNullius's reserved "unowned land" sentinel smallID (engine convention).
 TERRA_NULLIUS_SMALL_ID = 0
 
+# Engine UnitType string values (Game.ts). Defined here rather than reusing
+# action_encoder.UNIT_TYPES because action_encoder imports this module.
+# Structures get one viewer-side channel each; trade ships, trains and
+# shells are deliberately left out — they're constant background traffic,
+# not decisions anyone reacts to.
+STRUCTURE_UNIT_TYPES = {
+    "City": "own_city",
+    "Port": "own_port",
+    "Factory": "own_factory",
+    "Missile Silo": "own_missile_silo",
+    "SAM Launcher": "own_sam_launcher",
+    "Defense Post": "own_defense_post",
+}
+NUKE_UNIT_TYPES = frozenset({"Atom Bomb", "Hydrogen Bomb", "MIRV", "MIRV Warhead"})
+
+# An owner counts as "stronger"/"weaker" than the viewer once their troop
+# counts differ by more than this in log1p units (~1.65x). Bucketed into
+# three 0/1 channels instead of one continuous channel so every spatial
+# channel stays exactly 0 or 1 (see encode_spatial's uint8 note).
+STRENGTH_MARGIN = 0.5
+
 # Spatial tensor channel order — the single source of truth for what
 # channel N in encode_spatial()'s output means. Never hardcode a channel
 # index anywhere else; index into this list instead.
 SPATIAL_CHANNELS = [
+    # Terrain and ownership.
     "is_land",
     "is_shoreline",
     "owned_by_viewer",
@@ -52,6 +74,34 @@ SPATIAL_CHANNELS = [
     "owned_by_enemy",
     "has_fallout",
     "has_defense_bonus",
+    # Owner strength relative to the viewer — set on every tile of every
+    # other living player (allies included), never on the viewer's own.
+    "owner_stronger",
+    "owner_similar",
+    "owner_weaker",
+    # Attacks in progress: territory of whoever is attacking the viewer, and
+    # of whoever the viewer is attacking.
+    "owner_attacking_viewer",
+    "owner_attacked_by_viewer",
+    # The viewer's own structures, one channel per type (keys of
+    # STRUCTURE_UNIT_TYPES), at the unit's tile.
+    "own_city",
+    "own_port",
+    "own_factory",
+    "own_missile_silo",
+    "own_sam_launcher",
+    "own_defense_post",
+    # Enemy structures (allies excluded); SAMs separately, since they decide
+    # whether a nuke gets through.
+    "enemy_structure",
+    "enemy_sam_launcher",
+    # Ships at their current tile.
+    "own_transport",
+    "enemy_transport",
+    "own_warship",
+    "enemy_warship",
+    # Where enemy nukes in flight are going to land.
+    "incoming_nuke_target",
 ]
 
 # Flat feature order — same source-of-truth convention.
@@ -76,6 +126,21 @@ FLAT_FEATURES = [
     "enemy_alive_count",
     "ally_alive_count",
     "spawn_phase",
+    # Attacks in progress, summed over every attack touching the viewer.
+    "incoming_attack_troops_log1p",
+    "outgoing_attack_troops_log1p",
+    "num_incoming_attacks",
+    # Threats in transit: enemy boats (possible invasions) and enemy nukes.
+    "enemy_transports_log1p",
+    "enemy_nukes_in_flight",
+    # What the viewer has built — decides what's worth building next.
+    "own_city_count_log1p",
+    "own_port_count_log1p",
+    "own_factory_count_log1p",
+    "own_missile_silo_count_log1p",
+    "own_sam_launcher_count_log1p",
+    "own_defense_post_count_log1p",
+    "own_warship_count_log1p",
 ]
 
 # Per-candidate feature order for the target_player pointer head — same
@@ -100,6 +165,24 @@ PLAYER_FEATURES = [
     "shared_border_log1p",
     "is_attacking_viewer",
     "viewer_is_attacking",
+    # How hard, not just whether: troops committed to attacks between this
+    # candidate and the viewer, in each direction.
+    "incoming_attack_troops_log1p",
+    "outgoing_attack_troops_log1p",
+    # Troop density — how hard their territory is to push into.
+    "troops_per_tile_log1p",
+    # Where they are: the center of their land minus the center of the
+    # viewer's, as a fraction of map width/height. For terra nullius, the
+    # center of all unowned land. This is what lets boats pick targets the
+    # viewer doesn't border.
+    "centroid_dx",
+    "centroid_dy",
+    "centroid_distance",
+    "is_nation",
+    "is_bot",
+    # Worth taking / safe to nuke.
+    "structure_count_log1p",
+    "has_sam_launcher",
 ]
 
 
@@ -129,6 +212,72 @@ def _allied_small_ids(tick: TickSnapshot, viewer_small_id: int) -> set[int]:
         elif alliance.recipientSmallID == viewer_small_id:
             allies.add(alliance.requestorSmallID)
     return allies
+
+
+def _attack_troops(
+    tick: TickSnapshot, viewer_small_id: int
+) -> tuple[dict[int, float], dict[int, float]]:
+    """``(incoming, outgoing)``: troops in attacks on the viewer, keyed by
+    attacker smallID, and troops in the viewer's attacks, keyed by target
+    smallID (``TERRA_NULLIUS_SMALL_ID`` for expansion into unowned land)."""
+    incoming: dict[int, float] = {}
+    outgoing: dict[int, float] = {}
+    for attack in tick.attacks:
+        if attack.targetSmallID == viewer_small_id:
+            attacker = attack.attackerSmallID
+            incoming[attacker] = incoming.get(attacker, 0.0) + attack.troops
+        elif attack.attackerSmallID == viewer_small_id:
+            target = attack.targetSmallID
+            outgoing[target] = outgoing.get(target, 0.0) + attack.troops
+    return incoming, outgoing
+
+
+def _owner_channel(owner_id: np.ndarray, small_ids: set[int]) -> np.ndarray:
+    """``uint8`` ``(H, W)``: 1 on every tile owned by one of ``small_ids``.
+    A lookup table indexed by owner ID, so it's one vectorized gather no
+    matter how many players are in the set."""
+    lookup = np.zeros(_PLAYER_ID_MASK + 1, dtype=np.uint8)
+    lookup[[small_id for small_id in small_ids if 0 <= small_id <= _PLAYER_ID_MASK]] = 1
+    channel: np.ndarray = lookup[owner_id]
+    return channel
+
+
+def _unit_channel(
+    shape: tuple[int, int], units: list[UnitSnapshot], *, at_target: bool = False
+) -> np.ndarray:
+    """``uint8`` ``(H, W)``: 1 at each unit's tile (or its target tile, for
+    ``at_target``). Units without a target are skipped when ``at_target``,
+    and anything off the map is ignored rather than raising."""
+    channel = np.zeros(shape, dtype=np.uint8)
+    height, width = shape
+    for unit in units:
+        x, y = (unit.targetX, unit.targetY) if at_target else (unit.x, unit.y)
+        if x is not None and y is not None and 0 <= x < width and 0 <= y < height:
+            channel[y, x] = 1
+    return channel
+
+
+def _strength_buckets(
+    tick: TickSnapshot, viewer_small_id: int
+) -> tuple[set[int], set[int], set[int]]:
+    """``(stronger, similar, weaker)`` smallIDs of every other living player,
+    by troop count relative to the viewer (see ``STRENGTH_MARGIN``)."""
+    viewer = next((p for p in tick.players if p.smallID == viewer_small_id), None)
+    viewer_troops_log = np.log1p(viewer.troops) if viewer is not None else 0.0
+    stronger: set[int] = set()
+    similar: set[int] = set()
+    weaker: set[int] = set()
+    for player in tick.players:
+        if player.smallID == viewer_small_id or not player.isAlive:
+            continue
+        advantage = viewer_troops_log - np.log1p(player.troops)
+        if advantage < -STRENGTH_MARGIN:
+            stronger.add(player.smallID)
+        elif advantage > STRENGTH_MARGIN:
+            weaker.add(player.smallID)
+        else:
+            similar.add(player.smallID)
+    return stronger, similar, weaker
 
 
 def encode_spatial(header: SnapshotHeader, tick: TickSnapshot, viewer_small_id: int) -> np.ndarray:
@@ -161,18 +310,59 @@ def encode_spatial(header: SnapshotHeader, tick: TickSnapshot, viewer_small_id: 
     has_fallout = ((tile_state >> _FALLOUT_BIT) & 1).astype(np.uint8)
     has_defense_bonus = ((tile_state >> _DEFENSE_BONUS_BIT) & 1).astype(np.uint8)
 
-    return np.stack(
-        [
-            is_land,
-            is_shoreline,
-            owned_by_viewer,
-            owned_by_ally,
-            owned_by_enemy,
-            has_fallout,
-            has_defense_bonus,
-        ],
-        axis=0,
-    )
+    stronger, similar, weaker = _strength_buckets(tick, viewer_small_id)
+    incoming, outgoing = _attack_troops(tick, viewer_small_id)
+
+    shape = owner_id.shape
+    mine = [u for u in tick.units if u.ownerSmallID == viewer_small_id]
+    enemy = [
+        u
+        for u in tick.units
+        if u.ownerSmallID != viewer_small_id
+        and u.ownerSmallID != TERRA_NULLIUS_SMALL_ID
+        and u.ownerSmallID not in allies
+    ]
+
+    def own_of_type(unit_type: str) -> np.ndarray:
+        return _unit_channel(shape, [u for u in mine if u.type == unit_type])
+
+    channels: dict[str, np.ndarray] = {
+        "is_land": is_land,
+        "is_shoreline": is_shoreline,
+        "owned_by_viewer": owned_by_viewer,
+        "owned_by_ally": owned_by_ally,
+        "owned_by_enemy": owned_by_enemy,
+        "has_fallout": has_fallout,
+        "has_defense_bonus": has_defense_bonus,
+        "owner_stronger": _owner_channel(owner_id, stronger),
+        "owner_similar": _owner_channel(owner_id, similar),
+        "owner_weaker": _owner_channel(owner_id, weaker),
+        # Expansion into terra nullius is an outgoing attack too, but
+        # unowned land isn't anyone's territory to mark.
+        "owner_attacking_viewer": _owner_channel(owner_id, set(incoming)),
+        "owner_attacked_by_viewer": _owner_channel(
+            owner_id, set(outgoing) - {TERRA_NULLIUS_SMALL_ID}
+        ),
+        **{
+            channel_name: own_of_type(unit_type)
+            for unit_type, channel_name in STRUCTURE_UNIT_TYPES.items()
+        },
+        "enemy_structure": _unit_channel(
+            shape, [u for u in enemy if u.type in STRUCTURE_UNIT_TYPES]
+        ),
+        "enemy_sam_launcher": _unit_channel(shape, [u for u in enemy if u.type == "SAM Launcher"]),
+        "own_transport": own_of_type("Transport"),
+        "enemy_transport": _unit_channel(shape, [u for u in enemy if u.type == "Transport"]),
+        "own_warship": own_of_type("Warship"),
+        "enemy_warship": _unit_channel(shape, [u for u in enemy if u.type == "Warship"]),
+        "incoming_nuke_target": _unit_channel(
+            shape, [u for u in enemy if u.type in NUKE_UNIT_TYPES], at_target=True
+        ),
+    }
+    # Stacked in SPATIAL_CHANNELS order, so that list stays the one place
+    # that defines what channel N means (a KeyError here means a channel
+    # was named in the list but never computed).
+    return np.stack([channels[name] for name in SPATIAL_CHANNELS], axis=0)
 
 
 def encode_flat(tick: TickSnapshot, viewer_small_id: int) -> np.ndarray:
@@ -208,23 +398,53 @@ def encode_flat(tick: TickSnapshot, viewer_small_id: int) -> np.ndarray:
         if unit.ownerSmallID == viewer_small_id and unit.targetX is not None
     )
 
-    return np.array(
-        [
-            np.log1p(float(viewer.gold)),
-            np.log1p(viewer.troops),
-            np.log1p(viewer.numTilesOwned),
-            float(viewer.isAlive),
-            float(viewer.isTraitor),
-            len(allies),
-            units_in_flight,
-            np.log1p(enemy_total_tiles),
-            np.log1p(enemy_total_troops),
-            enemy_alive_count,
-            ally_alive_count,
-            float(tick.spawnPhase),
-        ],
-        dtype=np.float32,
-    )
+    incoming, outgoing = _attack_troops(tick, viewer_small_id)
+    own_counts: dict[str, int] = {}
+    enemy_transports = 0
+    enemy_nukes_in_flight = 0
+    for unit in tick.units:
+        if unit.ownerSmallID == viewer_small_id:
+            own_counts[unit.type] = own_counts.get(unit.type, 0) + 1
+        elif unit.ownerSmallID != TERRA_NULLIUS_SMALL_ID and unit.ownerSmallID not in allies:
+            if unit.type == "Transport":
+                enemy_transports += 1
+            elif unit.type in NUKE_UNIT_TYPES and unit.targetX is not None:
+                enemy_nukes_in_flight += 1
+
+    def own_count_log(unit_type: str) -> float:
+        return float(np.log1p(own_counts.get(unit_type, 0)))
+
+    values: dict[str, float] = {
+        "viewer_gold_log1p": np.log1p(float(viewer.gold)),
+        "viewer_troops_log1p": np.log1p(viewer.troops),
+        "viewer_num_tiles_owned_log1p": np.log1p(viewer.numTilesOwned),
+        "viewer_is_alive": float(viewer.isAlive),
+        "viewer_is_traitor": float(viewer.isTraitor),
+        "viewer_num_alliances": len(allies),
+        "viewer_units_in_flight": units_in_flight,
+        "enemy_total_tiles_owned_log1p": np.log1p(enemy_total_tiles),
+        "enemy_total_troops_log1p": np.log1p(enemy_total_troops),
+        "enemy_alive_count": enemy_alive_count,
+        "ally_alive_count": ally_alive_count,
+        "spawn_phase": float(tick.spawnPhase),
+        "incoming_attack_troops_log1p": np.log1p(sum(incoming.values())),
+        "outgoing_attack_troops_log1p": np.log1p(sum(outgoing.values())),
+        "num_incoming_attacks": sum(
+            1 for attack in tick.attacks if attack.targetSmallID == viewer_small_id
+        ),
+        "enemy_transports_log1p": np.log1p(enemy_transports),
+        "enemy_nukes_in_flight": enemy_nukes_in_flight,
+        "own_city_count_log1p": own_count_log("City"),
+        "own_port_count_log1p": own_count_log("Port"),
+        "own_factory_count_log1p": own_count_log("Factory"),
+        "own_missile_silo_count_log1p": own_count_log("Missile Silo"),
+        "own_sam_launcher_count_log1p": own_count_log("SAM Launcher"),
+        "own_defense_post_count_log1p": own_count_log("Defense Post"),
+        "own_warship_count_log1p": own_count_log("Warship"),
+    }
+    # Ordered by FLAT_FEATURES (a KeyError means a feature was named but
+    # never computed), so columns can never silently shift.
+    return np.array([values[name] for name in FLAT_FEATURES], dtype=np.float32)
 
 
 def _border_edge_counts(
@@ -245,6 +465,23 @@ def _border_edge_counts(
         crossing = mine[source] & ~mine[neighbor] & is_land[neighbor]
         counts += np.bincount(owner_id[neighbor][crossing], minlength=len(counts))
     return counts
+
+
+def _land_centroids(
+    owner_id: np.ndarray, is_land: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(center_x, center_y, has_land)``, each indexed by smallID: the mean
+    tile coordinate of every land tile each owner holds (terra nullius
+    included — the center of unowned land). One ``bincount`` pass per axis
+    for every player at once."""
+    rows, columns = np.nonzero(is_land)
+    owners = owner_id[rows, columns]
+    size = _PLAYER_ID_MASK + 1
+    counts = np.bincount(owners, minlength=size)
+    safe = np.maximum(counts, 1)
+    center_x = np.bincount(owners, weights=columns, minlength=size) / safe
+    center_y = np.bincount(owners, weights=rows, minlength=size) / safe
+    return center_x, center_y, counts > 0
 
 
 def encode_player_candidates(
@@ -273,30 +510,41 @@ def encode_player_candidates(
     owner_id = decode_tile_state(header, tick) & _PLAYER_ID_MASK
     border = _border_edge_counts(owner_id, is_land, viewer_small_id)
     allies = _allied_small_ids(tick, viewer_small_id)
-    attacking_viewer = {
-        a.attackerSmallID for a in tick.attacks if a.targetSmallID == viewer_small_id
-    }
-    attacked_by_viewer = {
-        a.targetSmallID for a in tick.attacks if a.attackerSmallID == viewer_small_id
-    }
+    incoming, outgoing = _attack_troops(tick, viewer_small_id)
     viewer_troops_log = np.log1p(viewer.troops)
+    center_x, center_y, has_land = _land_centroids(owner_id, is_land)
+
+    structures: dict[int, int] = {}
+    has_sam: set[int] = set()
+    for unit in tick.units:
+        if unit.type in STRUCTURE_UNIT_TYPES:
+            structures[unit.ownerSmallID] = structures.get(unit.ownerSmallID, 0) + 1
+        if unit.type == "SAM Launcher":
+            has_sam.add(unit.ownerSmallID)
+
+    def location(small_id: int) -> dict[str, float]:
+        # Relative to the viewer's own land; zero if either side owns none
+        # (e.g. the viewer just died, or no unowned land is left).
+        if not (has_land[small_id] and has_land[viewer_small_id]):
+            return {}
+        dx = (center_x[small_id] - center_x[viewer_small_id]) / header.width
+        dy = (center_y[small_id] - center_y[viewer_small_id]) / header.height
+        return {"centroid_dx": dx, "centroid_dy": dy, "centroid_distance": float(np.hypot(dx, dy))}
 
     unowned_land = int((is_land & (owner_id == TERRA_NULLIUS_SMALL_ID)).sum())
     small_ids = [TERRA_NULLIUS_SMALL_ID]
-    rows = [
-        [
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            np.log1p(unowned_land),
-            0.0,
-            0.0,
-            viewer_troops_log,
-            np.log1p(border[TERRA_NULLIUS_SMALL_ID]),
-            0.0,
-            float(TERRA_NULLIUS_SMALL_ID in attacked_by_viewer),
-        ]
+    rows: list[dict[str, float]] = [
+        {
+            "is_terra_nullius": 1.0,
+            "tiles_owned_log1p": np.log1p(unowned_land),
+            # Unowned land has no troops, so the viewer's whole army is the
+            # advantage.
+            "troop_advantage_log_ratio": viewer_troops_log,
+            "shared_border_log1p": np.log1p(border[TERRA_NULLIUS_SMALL_ID]),
+            "viewer_is_attacking": float(TERRA_NULLIUS_SMALL_ID in outgoing),
+            "outgoing_attack_troops_log1p": np.log1p(outgoing.get(TERRA_NULLIUS_SMALL_ID, 0.0)),
+            **location(TERRA_NULLIUS_SMALL_ID),
+        }
     ]
     others = sorted(
         (p for p in tick.players if p.smallID != viewer_small_id and p.isAlive),
@@ -305,21 +553,101 @@ def encode_player_candidates(
     for player in others:
         small_ids.append(player.smallID)
         rows.append(
-            [
-                0.0,
-                float(player.smallID in allies),
-                float(player.clientID is not None),
-                float(player.isTraitor),
-                np.log1p(player.numTilesOwned),
-                np.log1p(player.troops),
-                np.log1p(float(player.gold)),
-                viewer_troops_log - np.log1p(player.troops),
-                np.log1p(border[player.smallID]),
-                float(player.smallID in attacking_viewer),
-                float(player.smallID in attacked_by_viewer),
-            ]
+            {
+                "is_ally": float(player.smallID in allies),
+                "is_human": float(player.clientID is not None),
+                "is_traitor": float(player.isTraitor),
+                "tiles_owned_log1p": np.log1p(player.numTilesOwned),
+                "troops_log1p": np.log1p(player.troops),
+                "gold_log1p": np.log1p(float(player.gold)),
+                "troop_advantage_log_ratio": viewer_troops_log - np.log1p(player.troops),
+                "shared_border_log1p": np.log1p(border[player.smallID]),
+                "is_attacking_viewer": float(player.smallID in incoming),
+                "viewer_is_attacking": float(player.smallID in outgoing),
+                "incoming_attack_troops_log1p": np.log1p(incoming.get(player.smallID, 0.0)),
+                "outgoing_attack_troops_log1p": np.log1p(outgoing.get(player.smallID, 0.0)),
+                "troops_per_tile_log1p": np.log1p(player.troops / max(player.numTilesOwned, 1)),
+                "is_nation": float(player.type == "NATION"),
+                "is_bot": float(player.type == "BOT"),
+                "structure_count_log1p": np.log1p(structures.get(player.smallID, 0)),
+                "has_sam_launcher": float(player.smallID in has_sam),
+                **location(player.smallID),
+            }
         )
-    return np.array(small_ids, dtype=np.int64), np.array(rows, dtype=np.float32)
+    # Each row is a dict ordered by PLAYER_FEATURES; anything a row doesn't
+    # set (e.g. troops for terra nullius) is 0. Building rows by name rather
+    # than by position is what keeps a new feature from silently shifting
+    # every column after it.
+    features = [[row.get(name, 0.0) for name in PLAYER_FEATURES] for row in rows]
+    return np.array(small_ids, dtype=np.int64), np.array(features, dtype=np.float32)
+
+
+def encode_candidate_cells(
+    header: SnapshotHeader,
+    tick: TickSnapshot,
+    viewer_small_id: int,
+    candidate_small_ids: np.ndarray,
+    cell_factor: int,
+) -> np.ndarray:
+    """``int16`` ``[H // cell_factor, W // cell_factor]``: for each cell of
+    ``SpatialEncoder``'s feature map, the index (into ``candidate_small_ids``,
+    as returned by ``encode_player_candidates``) of whoever owns most of the
+    cell's land — ``-1`` if the cell has no land owned by a candidate.
+
+    This is what lets ``PolicyNetwork`` describe each target-player
+    candidate by *what their territory looks like* (the feature map averaged
+    over their cells), not only by their scalar row. Water and the viewer's
+    own tiles are ignored when picking a cell's owner, so a coastal or
+    front-line cell belongs to the neighbor or unowned land in it, not to
+    the sea or the viewer. Terra nullius is candidate 0, so unclaimed land
+    gets cells like any player.
+
+    ``cell_factor`` must match the model's ``SpatialEncoder.downsample_factor``;
+    cells floor-divide exactly like the conv trunk's pooling, so a map's last
+    ``H % cell_factor`` rows (and columns) are dropped the same way.
+    """
+    cell_height, cell_width = header.height // cell_factor, header.width // cell_factor
+    if cell_height == 0 or cell_width == 0:
+        return np.full((cell_height, cell_width), -1, dtype=np.int16)
+
+    is_land = ((decode_terrain(header) >> _IS_LAND_BIT) & 1).astype(bool)
+    owner_id = (decode_tile_state(header, tick) & _PLAYER_ID_MASK).astype(np.int32)
+    # Anything that shouldn't decide a cell's owner becomes a sentinel
+    # above every real smallID, so it sorts last and can be skipped.
+    ignored = _PLAYER_ID_MASK + 1
+    owner_id[~is_land | (owner_id == viewer_small_id)] = ignored
+
+    rows, columns = cell_height * cell_factor, cell_width * cell_factor
+    blocks = (
+        owner_id[:rows, :columns]
+        .reshape(cell_height, cell_factor, cell_width, cell_factor)
+        .transpose(0, 2, 1, 3)
+        .reshape(cell_height * cell_width, cell_factor * cell_factor)
+    )
+    majority = _row_mode(blocks, ignored)
+
+    to_candidate = np.full(ignored + 1, -1, dtype=np.int16)
+    to_candidate[candidate_small_ids] = np.arange(len(candidate_small_ids), dtype=np.int16)
+    cells: np.ndarray = to_candidate[majority].reshape(cell_height, cell_width)
+    return cells
+
+
+def _row_mode(values: np.ndarray, ignored: int) -> np.ndarray:
+    """The most common value in each row of ``values``, skipping
+    ``ignored`` (a row of only ``ignored`` returns ``ignored``). Vectorized:
+    sort each row, then the mode is where the longest run of equal values
+    ends."""
+    ordered = np.sort(values, axis=1)
+    positions = np.arange(ordered.shape[1])
+    run_starts = np.ones_like(ordered, dtype=bool)
+    run_starts[:, 1:] = ordered[:, 1:] != ordered[:, :-1]
+    start_index = np.maximum.accumulate(np.where(run_starts, positions, 0), axis=1)
+    run_length = positions - start_index + 1
+    run_length[ordered == ignored] = 0
+    best = run_length.argmax(axis=1)
+    mode: np.ndarray = ordered[np.arange(len(ordered)), best]
+    mode[run_length.max(axis=1) == 0] = ignored
+    return mode
 
 
 def encode_observation(

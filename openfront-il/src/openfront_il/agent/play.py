@@ -40,7 +40,12 @@ from openfront_il.features.action_encoder import (
     EncodedAction,
     encode_legality_mask,
 )
-from openfront_il.features.observation_encoder import SPATIAL_CHANNELS, encode_observation
+from openfront_il.features.observation_encoder import (
+    SPATIAL_CHANNELS,
+    encode_candidate_cells,
+    encode_observation,
+    encode_player_candidates,
+)
 from openfront_il.models.checkpoint_format import load_checkpoint
 from openfront_il.models.policy_network import PolicyNetwork
 from openfront_il.replay.snapshot_schema import LegalityMask, SnapshotHeader, TickSnapshot
@@ -101,6 +106,24 @@ class Decision:
     unit: str | None = None
     target_small_id: int | None = None
     tile: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class ModelInputs:
+    """Everything ``PolicyNetwork`` reads for one decision, from one
+    player's perspective — built once per step and reused for both forward
+    passes (action type, then the arguments conditioned on it).
+
+    Built by exactly the encoders the training examples were built with
+    (``example_loader.ExampleTable.example``), so the policy sees the same
+    format it was trained on.
+    """
+
+    spatial: np.ndarray  # [C, H, W] uint8
+    flat: np.ndarray  # [F] float32
+    candidate_ids: np.ndarray  # [N] smallIDs: terra nullius, then other living players
+    player_features: np.ndarray  # [N, P] float32, one row per candidate
+    candidate_cells: np.ndarray  # [H', W'] int16: which candidate owns each cell, -1 none
 
 
 @dataclass
@@ -195,16 +218,60 @@ class PolicyAgent:
         policy, _ = load_checkpoint(path)
         return cls(policy, **kwargs)
 
+    @property
+    def cell_factor(self) -> int:
+        """Tiles per feature-map cell side — the size of one ``tile_target``
+        / ``candidate_cells`` cell, fixed by the model's conv trunk."""
+        return self.policy.spatial_encoder.downsample_factor
+
     def reset(self, header: SnapshotHeader) -> None:
         """Call once per game: the decoder is tied to the map's size."""
         self._header = header
         self._decoder = ActionDecoder(
             width=header.width,
             height=header.height,
+            spatial_encoder_factor=self.cell_factor,
             greedy=self.greedy,
             temperature=self.temperature,
             rng=self.rng,
         )
+
+    def build_inputs(self, tick: TickSnapshot, viewer_small_id: int) -> ModelInputs:
+        """Step 1 of a decision: encode ``tick`` from the viewer's
+        perspective into everything the policy reads."""
+        if self._header is None:
+            raise RuntimeError("build_inputs() called before reset()")
+        header = self._header
+        spatial, flat = encode_observation(header, tick, viewer_small_id)
+        candidate_ids, player_features = encode_player_candidates(header, tick, viewer_small_id)
+        candidate_cells = encode_candidate_cells(
+            header, tick, viewer_small_id, candidate_ids, self.cell_factor
+        )
+        return ModelInputs(
+            spatial=spatial,
+            flat=flat,
+            candidate_ids=candidate_ids,
+            player_features=player_features,
+            candidate_cells=candidate_cells,
+        )
+
+    def _run_policy(
+        self, inputs: ModelInputs, action_type: int | None = None
+    ) -> dict[str, np.ndarray]:
+        """One forward pass on a batch of one -> each head's logits as numpy,
+        batch dimension dropped. ``action_type`` conditions the argument
+        heads (tile_target / target_player / amount) on that action; omitted,
+        the model conditions them on its own top action."""
+        with torch.no_grad():
+            logits = self.policy(
+                torch.from_numpy(inputs.spatial).unsqueeze(0),
+                torch.from_numpy(inputs.flat).unsqueeze(0),
+                torch.from_numpy(inputs.player_features).unsqueeze(0),
+                torch.ones(1, len(inputs.candidate_ids), dtype=torch.bool),
+                action_type=None if action_type is None else torch.tensor([action_type]),
+                candidate_cells=torch.from_numpy(inputs.candidate_cells).long().unsqueeze(0),
+            )
+        return {head: value[0].float().numpy() for head, value in logits.items()}
 
     def act(self, tick: TickSnapshot, client_id: str = AGENT_CLIENT_ID) -> Decision:
         if self._decoder is None or self._header is None:
@@ -214,13 +281,11 @@ class PolicyAgent:
         me = next(p for p in tick.players if p.clientID == client_id)
         legality = tick.legal[client_id]
 
-        spatial, flat = encode_observation(self._header, tick, me.smallID)
-        with torch.no_grad():
-            logits = self.policy(
-                torch.from_numpy(spatial).unsqueeze(0), torch.from_numpy(flat).unsqueeze(0)
-            )
-        action_logits = logits["action_type"][0].numpy()
-        unit_logits = logits["unit_type"][0].numpy()
+        inputs = self.build_inputs(tick, me.smallID)
+        spatial = inputs.spatial
+        logits = self._run_policy(inputs)
+        action_logits = logits["action_type"]
+        unit_logits = logits["unit_type"]
 
         mask = encode_legality_mask(
             legality, spawn_phase=tick.spawnPhase, viewer_num_tiles_owned=me.numTilesOwned
