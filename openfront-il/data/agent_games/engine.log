@@ -1,1 +1,8 @@
-[GameImpl] Constructor total: 23ms
+[GameImpl] Constructor total: 35ms
+cannot build Defense Post
+cannot build Defense Post
+[GameImpl] Constructor total: 41ms
+cannot send emoji from Player:{name:Oman,clientID:null,isAlive:true,troops:334670,numTileOwned:8193}] to Player:{name:Agent,clientID:AGENTIL1,isAlive:true,troops:396,numTileOwned:1053}]
+cannot build Defense Post
+cannot build Defense Post
+[GameImpl] Constructor total: 53ms

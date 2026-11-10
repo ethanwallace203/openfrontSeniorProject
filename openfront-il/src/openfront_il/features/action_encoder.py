@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from openfront_il.features.observation_encoder import SPATIAL_CHANNELS, TERRA_NULLIUS_SMALL_ID
+from openfront_il.features.observation_encoder import TERRA_NULLIUS_SMALL_ID, spatial_channel
 from openfront_il.replay.snapshot_schema import LegalityMask
 
 # The modeled action_type head. "noop" is not a real intent type — it's
@@ -334,7 +334,9 @@ def encode_legality_mask(
 def encode_tile_target_mask(spatial: np.ndarray, action_type: int, unit_type: int) -> np.ndarray:
     """``(H, W)`` bool mask of tiles that are plausible targets for
     ``action_type`` (with ``unit_type`` for ``build_unit``), derived from
-    an ``encode_spatial()`` tensor. All ``False`` for an action type not in
+    a spatial observation — full ``encode_spatial()`` ``(C, H, W)`` or
+    packed ``encode_spatial_packed()`` ``(H, W)``; only the handful of
+    channels a rule needs are read. All ``False`` for an action type not in
     ``TILE_TARGET_ACTION_TYPES``.
 
     Each rule mirrors what the engine does with the clicked tile (see the
@@ -348,13 +350,10 @@ def encode_tile_target_mask(spatial: np.ndarray, action_type: int, unit_type: in
     ``training/bc_trainer.py``'s ``masked_cross_entropy``), so a rule
     that's too strict costs probability mass, never a ``NaN``.
     """
-    channel: dict[str, np.ndarray] = {
-        name: np.asarray(spatial[index] > 0) for index, name in enumerate(SPATIAL_CHANNELS)
-    }
-    is_land = channel["is_land"]
-    mine = channel["owned_by_viewer"]
-    ally = channel["owned_by_ally"]
-    is_owned: np.ndarray = mine | ally | channel["owned_by_enemy"]
+    is_land = spatial_channel(spatial, "is_land")
+    mine = spatial_channel(spatial, "owned_by_viewer")
+    ally = spatial_channel(spatial, "owned_by_ally")
+    is_owned: np.ndarray = mine | ally | spatial_channel(spatial, "owned_by_enemy")
     not_land: np.ndarray = ~is_land
     name = ACTION_TYPES[action_type]
 
@@ -380,7 +379,10 @@ def encode_tile_target_mask(spatial: np.ndarray, action_type: int, unit_type: in
             # click for a shore tile you own (PlayerImpl.portSpawn), so only
             # your territory within reach of your own coast can work.
             return np.asarray(
-                mine & _within_manhattan(mine & channel["is_shoreline"], PORT_SHORE_RADIUS)
+                mine
+                & _within_manhattan(
+                    mine & spatial_channel(spatial, "is_shoreline"), PORT_SHORE_RADIUS
+                )
             )
         return mine
     return np.zeros_like(is_land)

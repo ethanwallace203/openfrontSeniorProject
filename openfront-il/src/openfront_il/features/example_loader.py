@@ -40,7 +40,8 @@ from openfront_il.features.observation_encoder import (
     FLAT_FEATURES,
     encode_candidate_cells,
     encode_player_candidates,
-    encode_spatial,
+    encode_spatial_packed,
+    unpack_spatial,
 )
 from openfront_il.replay import loader
 from openfront_il.replay.snapshot_schema import TickSnapshot
@@ -58,13 +59,21 @@ class ExampleTable:
     the open files and each worker reopens its own.
     """
 
-    def __init__(self, game_ids: list[str], *, cell_factor: int = 8) -> None:
+    def __init__(
+        self, game_ids: list[str], *, cell_factor: int = 8, packed_spatial: bool = False
+    ) -> None:
         """``cell_factor`` must match the model's
         ``SpatialEncoder.downsample_factor`` — it sizes each example's
         ``candidate_cells`` grid to line up with the feature map. The default
-        is the default 3-layer encoder's factor (2**3)."""
+        is the default 3-layer encoder's factor (2**3).
+
+        ``packed_spatial``: return ``spatial_packed`` (``encode_spatial_packed``,
+        ``(H, W)`` int32) instead of the full ``spatial`` tensor. The training
+        DataLoader uses this — building and shipping 25 full-map channels
+        per example was its bottleneck; the trainer unpacks on the GPU."""
         self.game_ids = game_ids
         self.cell_factor = cell_factor
+        self.packed_spatial = packed_spatial
         tables = [
             pq.read_table(paths.PROCESSED_DIR / f"{game_id}.parquet").to_pandas()
             for game_id in game_ids
@@ -111,7 +120,9 @@ class ExampleTable:
     def example(self, index: int) -> dict[str, np.ndarray | np.int64]:
         """Returns one example as plain numpy arrays:
 
-        - ``spatial`` ``[C, H, W]``, ``flat`` ``[F]``, ``action_type`` and
+        - ``spatial`` ``[C, H, W]`` uint8 — or, with ``packed_spatial``,
+          ``spatial_packed`` ``[H, W]`` int32 (see ``encode_spatial_packed``).
+          ``flat`` ``[F]``, ``action_type`` and
           ``unit_type`` (0-d int64), ``legality_mask`` ``[len(ACTION_TYPES)]``.
         - ``target_x`` / ``target_y`` (0-d int64): the tile argument, or
           ``-1`` when this row's action type takes no tile (or its tile
@@ -136,7 +147,13 @@ class ExampleTable:
         unit_type = int(row["unit_type"])
         action_name = ACTION_TYPES[action_type]
 
-        spatial = encode_spatial(header, tick, viewer_small_id=small_id)
+        # The tile mask reads its few channels straight from either form.
+        packed = encode_spatial_packed(header, tick, viewer_small_id=small_id)
+        spatial_entry = (
+            {"spatial_packed": packed}
+            if self.packed_spatial
+            else {"spatial": unpack_spatial(packed)}
+        )
         flat = row[FLAT_FEATURES].to_numpy(dtype=np.float32)
         legality_mask = np.asarray(row["legality_mask"], dtype=bool)
 
@@ -165,14 +182,14 @@ class ExampleTable:
         amount_bucket = -1 if pd.isna(raw_bucket) else int(raw_bucket)
 
         return {
-            "spatial": spatial,
+            **spatial_entry,
             "flat": flat,
             "action_type": np.int64(action_type),
             "unit_type": np.int64(unit_type),
             "legality_mask": legality_mask,
             "target_x": np.int64(target_x),
             "target_y": np.int64(target_y),
-            "tile_legal": encode_tile_target_mask(spatial, action_type, unit_type),
+            "tile_legal": encode_tile_target_mask(packed, action_type, unit_type),
             "player_features": player_features,
             "candidate_cells": candidate_cells,
             "player_legal": player_legal,

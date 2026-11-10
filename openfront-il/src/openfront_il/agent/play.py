@@ -214,6 +214,10 @@ class PolicyAgent:
             pick noop nearly every step; sampling shows its real mix.
         temperature: sampling temperature (only used when not greedy).
         seed: seeds both action sampling and the temporary rules.
+        noop_penalty: subtracted from the noop logit before the action type
+            is chosen. A play-time knob, not part of the trained policy: an
+            undertrained BC model is far more passive in live games than the
+            humans it imitates (see scripts/06_play_live.py --noop-penalty).
     """
 
     def __init__(
@@ -223,10 +227,12 @@ class PolicyAgent:
         greedy: bool = False,
         temperature: float = 1.0,
         seed: int | None = None,
+        noop_penalty: float = 0.0,
     ) -> None:
         self.policy = policy.eval()
         self.greedy = greedy
         self.temperature = temperature
+        self.noop_penalty = noop_penalty
         self.rng = np.random.default_rng(seed)
         self._decoder: ActionDecoder | None = None
         self._header: SnapshotHeader | None = None
@@ -348,7 +354,10 @@ class PolicyAgent:
         legal — the agent then does nothing this step."""
         if self._decoder is None:
             raise RuntimeError("choose_action_type() called before reset()")
-        return self._decoder.mask_choice(logits["action_type"], mask)
+        # A copy, so argument_logits() still sees the model's own top action.
+        action_logits = logits["action_type"].astype(np.float64)
+        action_logits[_ACTION_INDEX["noop"]] -= self.noop_penalty
+        return self._decoder.mask_choice(action_logits, mask)
 
     def argument_logits(
         self, inputs: ModelInputs, first_pass: dict[str, np.ndarray], action_type: int

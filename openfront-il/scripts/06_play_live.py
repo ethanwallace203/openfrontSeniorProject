@@ -7,7 +7,7 @@ in `engine/bridge/src/liveGame.ts`. See scripts/README.md.
 Usage:
     python scripts/06_play_live.py [--checkpoint PATH] [--map Onion] [--bots 4]
         [--difficulty Medium] [--games 1] [--seed S] [--greedy] [--temperature 1.0]
-        [--max-steps 5000] [--no-save] [--verbose]
+        [--noop-penalty 0.0] [--max-steps 5000] [--no-save] [--verbose]
 """
 
 import argparse
@@ -30,6 +30,12 @@ def main() -> None:
     parser.add_argument("--seed", default=None, help="base seed; game i uses '<seed>-<i>'")
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--noop-penalty",
+        type=float,
+        default=0.0,
+        help="subtract this from the noop logit, making the agent act more often",
+    )
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--no-save", action="store_true")
     parser.add_argument("--verbose", action="store_true", help="log every intent sent")
@@ -47,6 +53,7 @@ def main() -> None:
         greedy=args.greedy,
         temperature=args.temperature,
         seed=None if args.seed is None else zlib.crc32(args.seed.encode()),
+        noop_penalty=args.noop_penalty,
     )
     wins = 0
     with LiveGame(log_path=paths.AGENT_GAMES_DIR / "engine.log") as game:

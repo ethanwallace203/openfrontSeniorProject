@@ -232,29 +232,44 @@ def _attack_troops(
     return incoming, outgoing
 
 
-def _owner_channel(owner_id: np.ndarray, small_ids: set[int]) -> np.ndarray:
-    """``uint8`` ``(H, W)``: 1 on every tile owned by one of ``small_ids``.
-    A lookup table indexed by owner ID, so it's one vectorized gather no
-    matter how many players are in the set."""
-    lookup = np.zeros(_PLAYER_ID_MASK + 1, dtype=np.uint8)
-    lookup[[small_id for small_id in small_ids if 0 <= small_id <= _PLAYER_ID_MASK]] = 1
-    channel: np.ndarray = lookup[owner_id]
-    return channel
+# Channel N of the spatial tensor is bit N of the packed int32 encoding
+# (encode_spatial_packed). int32 rather than uint32 because torch's bit
+# shifts are defined for signed ints; 25 channels leave the sign bit unused.
+assert len(SPATIAL_CHANNELS) <= 31, "packed spatial encoding holds at most 31 channels"
+_BIT = {name: np.int32(1 << index) for index, name in enumerate(SPATIAL_CHANNELS)}
+
+# Terrain never changes within a game, so its two channels are computed
+# once per game and reused for every tick and viewer. Keyed by gameId; a
+# handful of entries covers every game a DataLoader worker interleaves.
+_TERRAIN_BITS_CACHE: dict[str, np.ndarray] = {}
+_TERRAIN_BITS_CACHE_SIZE = 8
 
 
-def _unit_channel(
-    shape: tuple[int, int], units: list[UnitSnapshot], *, at_target: bool = False
-) -> np.ndarray:
-    """``uint8`` ``(H, W)``: 1 at each unit's tile (or its target tile, for
-    ``at_target``). Units without a target are skipped when ``at_target``,
-    and anything off the map is ignored rather than raising."""
-    channel = np.zeros(shape, dtype=np.uint8)
-    height, width = shape
+def _terrain_bits(header: SnapshotHeader) -> np.ndarray:
+    """``int32`` ``(H, W)``: the ``is_land`` and ``is_shoreline`` bits."""
+    cached = _TERRAIN_BITS_CACHE.get(header.gameId)
+    if cached is not None and cached.shape == (header.height, header.width):
+        return cached
+    terrain = decode_terrain(header).astype(np.int32)
+    bits: np.ndarray = ((terrain >> _IS_LAND_BIT) & 1) * _BIT["is_land"]
+    bits |= ((terrain >> _SHORELINE_BIT) & 1) * _BIT["is_shoreline"]
+    if len(_TERRAIN_BITS_CACHE) >= _TERRAIN_BITS_CACHE_SIZE:
+        _TERRAIN_BITS_CACHE.pop(next(iter(_TERRAIN_BITS_CACHE)))
+    _TERRAIN_BITS_CACHE[header.gameId] = bits
+    return bits
+
+
+def _set_unit_bits(
+    packed: np.ndarray, units: list[UnitSnapshot], bit: np.int32, *, at_target: bool = False
+) -> None:
+    """ORs ``bit`` into ``packed`` at each unit's tile (or its target tile,
+    for ``at_target``). Units without a target are skipped when
+    ``at_target``, and anything off the map is ignored rather than raising."""
+    height, width = packed.shape
     for unit in units:
         x, y = (unit.targetX, unit.targetY) if at_target else (unit.x, unit.y)
         if x is not None and y is not None and 0 <= x < width and 0 <= y < height:
-            channel[y, x] = 1
-    return channel
+            packed[y, x] |= bit
 
 
 def _strength_buckets(
@@ -280,40 +295,57 @@ def _strength_buckets(
     return stronger, similar, weaker
 
 
-def encode_spatial(header: SnapshotHeader, tick: TickSnapshot, viewer_small_id: int) -> np.ndarray:
-    """Builds the ``(len(SPATIAL_CHANNELS), height, width)`` spatial
-    tensor for one tick, from ``viewer_small_id``'s perspective.
+def encode_spatial_packed(
+    header: SnapshotHeader, tick: TickSnapshot, viewer_small_id: int
+) -> np.ndarray:
+    """The spatial observation, bit-packed: ``int32`` ``(height, width)``
+    where bit N of a tile is that tile's value in channel
+    ``SPATIAL_CHANNELS[N]`` (every channel is 0 or 1). ``encode_spatial``
+    is exactly this, unpacked.
 
-    ``uint8``, not float: every channel is exactly 0 or 1, so one byte per
-    value loses nothing and is 4x smaller than float32 — a Europe-size
-    example is ~34MB instead of ~136MB, which is what decides how many
-    prefetched batches fit in RAM and how fast they copy to the GPU.
-    ``SpatialEncoder`` casts to float itself, on whatever device it runs on.
+    Built directly in packed form because that's what keeps training data
+    loading fast: a full ``[C, H, W]`` tensor is 25 separate full-map
+    arrays, and building + stacking + copying them out of DataLoader
+    workers was the training bottleneck (memory bandwidth, not compute).
+    Here it's a handful of full-map passes:
+
+    - terrain bits: computed once per game and cached (``_terrain_bits``);
+    - all 10 owner-derived channels (ownership, strength, attacks): one
+      lookup table indexed by owner smallID, applied in a single gather;
+    - fallout / defense bonus: two shifts of the tile state;
+    - units: set only at the tiles they occupy.
     """
-    terrain = decode_terrain(header)
-    tile_state = decode_tile_state(header, tick)
-
-    is_land = ((terrain >> _IS_LAND_BIT) & 1).astype(np.uint8)
-    is_shoreline = ((terrain >> _SHORELINE_BIT) & 1).astype(np.uint8)
-
+    tile_state = decode_tile_state(header, tick).astype(np.int32)
     owner_id = tile_state & _PLAYER_ID_MASK
     allies = _allied_small_ids(tick, viewer_small_id)
-    ally_list = list(allies)
-
-    owned_by_viewer = (owner_id == viewer_small_id).astype(np.uint8)
-    owned_by_ally = np.isin(owner_id, ally_list).astype(np.uint8)
-    is_owned = owner_id != TERRA_NULLIUS_SMALL_ID
-    owned_by_enemy = (
-        is_owned & (owner_id != viewer_small_id) & ~np.isin(owner_id, ally_list)
-    ).astype(np.uint8)
-
-    has_fallout = ((tile_state >> _FALLOUT_BIT) & 1).astype(np.uint8)
-    has_defense_bonus = ((tile_state >> _DEFENSE_BONUS_BIT) & 1).astype(np.uint8)
-
     stronger, similar, weaker = _strength_buckets(tick, viewer_small_id)
     incoming, outgoing = _attack_troops(tick, viewer_small_id)
 
-    shape = owner_id.shape
+    def in_range(small_ids: set[int]) -> list[int]:
+        return [i for i in small_ids if 0 <= i <= _PLAYER_ID_MASK]
+
+    # One entry per possible owner: every channel bit that owner's tiles get.
+    owner_bits = np.zeros(_PLAYER_ID_MASK + 1, dtype=np.int32)
+    owner_bits[1:] = _BIT["owned_by_enemy"]  # any owner but terra nullius...
+    owner_bits[in_range(allies)] = _BIT["owned_by_ally"]  # ...unless an ally
+    if 0 <= viewer_small_id <= _PLAYER_ID_MASK:
+        owner_bits[viewer_small_id] = _BIT["owned_by_viewer"]  # ...or the viewer
+    owner_bits[TERRA_NULLIUS_SMALL_ID] = 0
+    owner_bits[in_range(stronger)] |= _BIT["owner_stronger"]
+    owner_bits[in_range(similar)] |= _BIT["owner_similar"]
+    owner_bits[in_range(weaker)] |= _BIT["owner_weaker"]
+    owner_bits[in_range(set(incoming))] |= _BIT["owner_attacking_viewer"]
+    # Expansion into terra nullius is an outgoing attack too, but unowned
+    # land isn't anyone's territory to mark.
+    owner_bits[in_range(set(outgoing) - {TERRA_NULLIUS_SMALL_ID})] |= _BIT[
+        "owner_attacked_by_viewer"
+    ]
+
+    packed: np.ndarray = owner_bits[owner_id]
+    packed |= _terrain_bits(header)
+    packed |= ((tile_state >> _FALLOUT_BIT) & 1) * _BIT["has_fallout"]
+    packed |= ((tile_state >> _DEFENSE_BONUS_BIT) & 1) * _BIT["has_defense_bonus"]
+
     mine = [u for u in tick.units if u.ownerSmallID == viewer_small_id]
     enemy = [
         u
@@ -322,47 +354,77 @@ def encode_spatial(header: SnapshotHeader, tick: TickSnapshot, viewer_small_id: 
         and u.ownerSmallID != TERRA_NULLIUS_SMALL_ID
         and u.ownerSmallID not in allies
     ]
+    for unit_type, channel_name in STRUCTURE_UNIT_TYPES.items():
+        _set_unit_bits(packed, [u for u in mine if u.type == unit_type], _BIT[channel_name])
+    _set_unit_bits(
+        packed, [u for u in enemy if u.type in STRUCTURE_UNIT_TYPES], _BIT["enemy_structure"]
+    )
+    _set_unit_bits(
+        packed, [u for u in enemy if u.type == "SAM Launcher"], _BIT["enemy_sam_launcher"]
+    )
+    _set_unit_bits(packed, [u for u in mine if u.type == "Transport"], _BIT["own_transport"])
+    _set_unit_bits(packed, [u for u in enemy if u.type == "Transport"], _BIT["enemy_transport"])
+    _set_unit_bits(packed, [u for u in mine if u.type == "Warship"], _BIT["own_warship"])
+    _set_unit_bits(packed, [u for u in enemy if u.type == "Warship"], _BIT["enemy_warship"])
+    _set_unit_bits(
+        packed,
+        [u for u in enemy if u.type in NUKE_UNIT_TYPES],
+        _BIT["incoming_nuke_target"],
+        at_target=True,
+    )
+    return packed
 
-    def own_of_type(unit_type: str) -> np.ndarray:
-        return _unit_channel(shape, [u for u in mine if u.type == unit_type])
 
-    channels: dict[str, np.ndarray] = {
-        "is_land": is_land,
-        "is_shoreline": is_shoreline,
-        "owned_by_viewer": owned_by_viewer,
-        "owned_by_ally": owned_by_ally,
-        "owned_by_enemy": owned_by_enemy,
-        "has_fallout": has_fallout,
-        "has_defense_bonus": has_defense_bonus,
-        "owner_stronger": _owner_channel(owner_id, stronger),
-        "owner_similar": _owner_channel(owner_id, similar),
-        "owner_weaker": _owner_channel(owner_id, weaker),
-        # Expansion into terra nullius is an outgoing attack too, but
-        # unowned land isn't anyone's territory to mark.
-        "owner_attacking_viewer": _owner_channel(owner_id, set(incoming)),
-        "owner_attacked_by_viewer": _owner_channel(
-            owner_id, set(outgoing) - {TERRA_NULLIUS_SMALL_ID}
-        ),
-        **{
-            channel_name: own_of_type(unit_type)
-            for unit_type, channel_name in STRUCTURE_UNIT_TYPES.items()
-        },
-        "enemy_structure": _unit_channel(
-            shape, [u for u in enemy if u.type in STRUCTURE_UNIT_TYPES]
-        ),
-        "enemy_sam_launcher": _unit_channel(shape, [u for u in enemy if u.type == "SAM Launcher"]),
-        "own_transport": own_of_type("Transport"),
-        "enemy_transport": _unit_channel(shape, [u for u in enemy if u.type == "Transport"]),
-        "own_warship": own_of_type("Warship"),
-        "enemy_warship": _unit_channel(shape, [u for u in enemy if u.type == "Warship"]),
-        "incoming_nuke_target": _unit_channel(
-            shape, [u for u in enemy if u.type in NUKE_UNIT_TYPES], at_target=True
-        ),
-    }
-    # Stacked in SPATIAL_CHANNELS order, so that list stays the one place
-    # that defines what channel N means (a KeyError here means a channel
-    # was named in the list but never computed).
-    return np.stack([channels[name] for name in SPATIAL_CHANNELS], axis=0)
+def unpack_spatial(packed: np.ndarray) -> np.ndarray:
+    """Packed ``(H, W)`` ``int32`` -> ``(len(SPATIAL_CHANNELS), H, W)``
+    ``uint8`` 0/1 — the full spatial tensor.
+
+    Works one byte-plane at a time (bits 0-7, 8-15, ...) in ``uint8`` —
+    measured ~2x faster than shifting the full ``int32`` once per channel,
+    since every pass touches a quarter of the memory."""
+    count = len(SPATIAL_CHANNELS)
+    as_bytes = packed.astype("<i4", copy=False).view(np.uint8).reshape(*packed.shape, 4)
+    channels = np.empty((count, *packed.shape), dtype=np.uint8)
+    for byte in range((count + 7) // 8):
+        plane = np.ascontiguousarray(as_bytes[..., byte])
+        for bit in range(min(8, count - byte * 8)):
+            channels[byte * 8 + bit] = (plane >> bit) & 1
+    return channels
+
+
+def pack_spatial(spatial: np.ndarray) -> np.ndarray:
+    """Inverse of ``unpack_spatial``: ``(C, H, W)`` 0/1 -> packed ``(H, W)``
+    ``int32``. For tests and tools; the encoders build packed form directly."""
+    packed = np.zeros(spatial.shape[1:], dtype=np.int32)
+    for index in range(spatial.shape[0]):
+        packed |= spatial[index].astype(np.int32) << index
+    return packed
+
+
+def spatial_channel(spatial: np.ndarray, name: str) -> np.ndarray:
+    """One channel of a spatial observation as an ``(H, W)`` bool mask,
+    from either form — full ``(C, H, W)`` or packed ``(H, W)``. Lets code
+    that only needs a few channels (e.g. the tile-target masks) read them
+    straight from packed form without unpacking all 25."""
+    index = SPATIAL_CHANNELS.index(name)
+    if spatial.ndim == 2:
+        channel: np.ndarray = ((spatial >> index) & 1).astype(bool)
+    else:
+        channel = np.asarray(spatial[index] > 0)
+    return channel
+
+
+def encode_spatial(header: SnapshotHeader, tick: TickSnapshot, viewer_small_id: int) -> np.ndarray:
+    """Builds the ``(len(SPATIAL_CHANNELS), height, width)`` spatial
+    tensor for one tick, from ``viewer_small_id``'s perspective —
+    ``encode_spatial_packed``, unpacked (that function documents every
+    channel's rule).
+
+    ``uint8``, not float: every channel is exactly 0 or 1, so one byte per
+    value loses nothing and is 4x smaller than float32. ``SpatialEncoder``
+    casts to float itself, on whatever device it runs on.
+    """
+    return unpack_spatial(encode_spatial_packed(header, tick, viewer_small_id))
 
 
 def encode_flat(tick: TickSnapshot, viewer_small_id: int) -> np.ndarray:

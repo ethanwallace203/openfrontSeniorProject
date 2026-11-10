@@ -98,7 +98,7 @@ class BCDataset(Dataset[dict[str, Tensor]]):
 
     def __init__(self, game_ids: list[str], *, cell_factor: int = 8) -> None:
         self.game_ids = game_ids
-        self.table = ExampleTable(game_ids, cell_factor=cell_factor)
+        self.table = ExampleTable(game_ids, cell_factor=cell_factor, packed_spatial=True)
 
     def __len__(self) -> int:
         return len(self.table)
@@ -109,7 +109,10 @@ class BCDataset(Dataset[dict[str, Tensor]]):
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         example = self.table.example(index)
         return {
-            "spatial": torch.from_numpy(example["spatial"]),
+            # One int32 of channel bits per tile ([1, H, W] so collate pads it
+            # like a spatial tensor); _to_device unpacks it on the GPU. See
+            # observation_encoder.encode_spatial_packed.
+            "spatial_packed": torch.from_numpy(np.asarray(example["spatial_packed"])).unsqueeze(0),
             "flat": torch.from_numpy(example["flat"]),
             "action_type": torch.tensor(int(example["action_type"]), dtype=torch.long),
             "unit_type": torch.tensor(int(example["unit_type"]), dtype=torch.long),
@@ -235,9 +238,15 @@ def collate_examples(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     the batch's max ``N``, and a ``player_valid`` mask marks the real
     candidates — ``PolicyNetwork`` uses it to keep padded slots out of
     the ``target_player`` softmax.
+
+    Items from ``BCDataset`` carry ``spatial_packed`` (bit-packed channels,
+    see ``unpack_spatial``) instead of ``spatial``; either is padded the
+    same way — a zero byte unpacks to all-zero channels — and the batch
+    keeps whichever key the items had.
     """
-    max_height = max(item["spatial"].shape[1] for item in batch)
-    max_width = max(item["spatial"].shape[2] for item in batch)
+    spatial_key = "spatial_packed" if "spatial_packed" in batch[0] else "spatial"
+    max_height = max(item[spatial_key].shape[1] for item in batch)
+    max_width = max(item[spatial_key].shape[2] for item in batch)
     max_candidates = max(item["player_features"].shape[0] for item in batch)
     # max(H_i) // f == max(H_i // f), so padding every cell grid to the
     # batch's largest one matches the feature map of the padded spatial.
@@ -251,7 +260,7 @@ def collate_examples(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     padded_player_legal = []
     player_valid = []
     for item in batch:
-        spatial = item["spatial"]
+        spatial = item[spatial_key]
         pad_bottom = max_height - spatial.shape[1]
         pad_right = max_width - spatial.shape[2]
         padded_spatial.append(functional.pad(spatial, (0, pad_right, 0, pad_bottom)))
@@ -279,7 +288,7 @@ def collate_examples(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         player_valid.append(torch.arange(max_candidates) < candidate_count)
 
     return {
-        "spatial": torch.stack(padded_spatial),
+        spatial_key: torch.stack(padded_spatial),
         "flat": torch.stack([item["flat"] for item in batch]),
         "action_type": torch.stack([item["action_type"] for item in batch]),
         "unit_type": torch.stack([item["unit_type"] for item in batch]),
@@ -368,10 +377,30 @@ def _autocast(device: torch.device, enabled: bool) -> AbstractContextManager[obj
     return nullcontext()
 
 
+def unpack_spatial(packed: Tensor, channels: int) -> Tensor:
+    """``observation_encoder.unpack_spatial``, batched and on whatever device
+    ``packed`` is on: ``[B, 1, H, W]`` ``int32`` (bit ``c`` = channel ``c``)
+    -> ``[B, C, H, W]`` ``uint8`` of 0/1. One shift-and-mask per channel —
+    trivial next to the forward pass when run on the GPU."""
+    bits = packed[:, 0]
+    out = torch.empty(
+        (bits.shape[0], channels, *bits.shape[1:]), dtype=torch.uint8, device=packed.device
+    )
+    for channel in range(channels):
+        out[:, channel] = ((bits >> channel) & 1).to(torch.uint8)
+    return out
+
+
 def _to_device(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
     # non_blocking pairs with the DataLoader's pin_memory to overlap the
     # host->GPU copy with compute; it's a plain copy on CPU.
-    return {name: tensor.to(device, non_blocking=True) for name, tensor in batch.items()}
+    moved = {name: tensor.to(device, non_blocking=True) for name, tensor in batch.items()}
+    # Unpack after the copy, so the 8x-smaller packed form is what crosses
+    # from the worker processes and over PCIe.
+    packed = moved.pop("spatial_packed", None)
+    if packed is not None:
+        moved["spatial"] = unpack_spatial(packed, len(SPATIAL_CHANNELS))
+    return moved
 
 
 def _make_loader(

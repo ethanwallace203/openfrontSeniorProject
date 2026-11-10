@@ -5,8 +5,8 @@ learning_rate: 0.001
 # Full-resolution maps are big. Measured on a 3090 (24GB) at Europe size
 # (2904x1672) with bf16: batch 16 peaks at 13GB, batch 32 runs out of
 # memory. Raise it only if every game in the dataset is a small map.
-batch_size: 4
-epochs: 1
+batch_size: 8
+epochs: 10
 seed: 1337
 checkpoint_dir: checkpoints
 
@@ -51,7 +51,7 @@ device: auto
 # so fewer than ~5 workers leaves the GPU waiting. 0 = load in the
 # training process. Peak RAM is mostly batches queued by workers (2 per
 # worker): measured ~16GB total at Europe size with 8 workers, batch 16.
-num_workers: 8
+num_workers: 6
 # bf16 autocast on CUDA. Measured on a 3090 at Europe size, batch 16:
 # 47 -> 24 ms/example and 17.8 -> 13.0GB peak. Ignored on CPU.
 mixed_precision: true

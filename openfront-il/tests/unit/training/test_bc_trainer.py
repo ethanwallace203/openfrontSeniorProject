@@ -8,10 +8,12 @@ import torch
 
 from openfront_il.features import dataset_builder
 from openfront_il.features.action_encoder import ACTION_TYPES, AMOUNT_BUCKET_VALUES, UNIT_TYPES
+from openfront_il.features.example_loader import ExampleTable
 from openfront_il.features.observation_encoder import (
     FLAT_FEATURES,
     PLAYER_FEATURES,
     SPATIAL_CHANNELS,
+    pack_spatial,
 )
 from openfront_il.models.checkpoint_format import load_checkpoint
 from openfront_il.training import bc_trainer
@@ -349,8 +351,66 @@ class TestMapGroupedBatchSampler:
                 persistent=False,
             )
             height, width = dataset.table.map_shape("USR3SJiv")
-            for batch in loader:
-                assert batch["spatial"].shape[2:] == (height, width)
+            for cpu_batch in loader:
+                batch = bc_trainer._to_device(cpu_batch, torch.device("cpu"))
+                assert batch["spatial"].shape[1:] == (len(SPATIAL_CHANNELS), height, width)
+            dataset.close()
+        finally:
+            shutil.rmtree(paths.SNAPSHOTS_DIR, ignore_errors=True)
+            shutil.rmtree(paths.PROCESSED_DIR, ignore_errors=True)
+
+
+class TestSpatialPacking:
+    def test_pack_unpack_round_trip(self) -> None:
+        rng = np.random.default_rng(0)
+        spatial = (rng.random((len(SPATIAL_CHANNELS), 7, 9)) < 0.5).astype(np.uint8)
+
+        packed = pack_spatial(spatial)
+        unpacked = bc_trainer.unpack_spatial(
+            torch.from_numpy(packed).view(1, 1, 7, 9), len(SPATIAL_CHANNELS)
+        )
+
+        assert packed.shape == (7, 9)
+        assert packed.dtype == np.int32
+        assert torch.equal(unpacked[0], torch.from_numpy(spatial))
+
+    def test_padding_a_packed_batch_unpacks_to_zero_channels(self) -> None:
+        small, big = (
+            _item(4, 4, action_type="noop"),
+            _item(8, 8, action_type="noop"),
+        )
+        for item in (small, big):
+            item["spatial_packed"] = torch.from_numpy(
+                pack_spatial(item.pop("spatial").to(torch.uint8).numpy())
+            ).unsqueeze(0)
+
+        batch = bc_trainer._to_device(
+            bc_trainer.collate_examples([small, big]), torch.device("cpu")
+        )
+
+        assert "spatial_packed" not in batch
+        assert batch["spatial"].shape == (2, len(SPATIAL_CHANNELS), 8, 8)
+        assert torch.all(batch["spatial"][0, :, :4, :4] == 1)
+        assert torch.all(batch["spatial"][0, :, 4:, :] == 0)
+
+    def test_dataset_item_unpacks_to_the_encoded_spatial(self, tmp_path: Path) -> None:
+        """What the trainer feeds the model (packed in the worker, unpacked on
+        device) equals the full tensor evaluation and play use."""
+        paths.SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy(FIXTURE, paths.snapshot_path("USR3SJiv"))
+        dataset_builder.build_dataset_for_game("USR3SJiv")
+        try:
+            dataset = bc_trainer.BCDataset(["USR3SJiv"])
+            full = ExampleTable(["USR3SJiv"])
+            for index in (0, len(dataset) // 2, len(dataset) - 1):
+                expected = full.example(index)
+                item = dataset[index]
+                batch = bc_trainer._to_device(
+                    bc_trainer.collate_examples([item]), torch.device("cpu")
+                )
+                assert torch.equal(batch["spatial"][0], torch.from_numpy(expected["spatial"]))
+                assert torch.equal(item["tile_legal"], torch.from_numpy(expected["tile_legal"]))
+            full.close()
             dataset.close()
         finally:
             shutil.rmtree(paths.SNAPSHOTS_DIR, ignore_errors=True)

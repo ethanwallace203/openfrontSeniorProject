@@ -14,6 +14,10 @@ from openfront_il.features.observation_encoder import (
     encode_observation,
     encode_player_candidates,
     encode_spatial,
+    encode_spatial_packed,
+    pack_spatial,
+    spatial_channel,
+    unpack_spatial,
 )
 from openfront_il.replay.snapshot_schema import (
     AllianceSnapshot,
@@ -585,3 +589,27 @@ class TestEncodeObservation:
 
         assert spatial.shape == (len(SPATIAL_CHANNELS), 1, 2)
         assert flat.shape == (len(FLAT_FEATURES),)
+
+
+class TestPackedSpatial:
+    def test_packed_unpacks_to_encode_spatial(self) -> None:
+        header = TestSituationalAwareness()._header()
+        tick = TestSituationalAwareness()._tick(
+            units=[_unit("City", 1, 1), _unit("Atom Bomb", 2, 2, target=(1, 0))],
+            attacks=[_attack(2, 1, 50.0), _attack(1, 4, 20.0)],
+        )
+        packed = encode_spatial_packed(header, tick, viewer_small_id=1)
+
+        assert packed.dtype == np.int32 and packed.shape == (1, 5)
+        np.testing.assert_array_equal(unpack_spatial(packed), encode_spatial(header, tick, 1))
+        np.testing.assert_array_equal(pack_spatial(unpack_spatial(packed)), packed)
+
+    def test_spatial_channel_reads_either_form(self) -> None:
+        header = TestSituationalAwareness()._header()
+        tick = TestSituationalAwareness()._tick()
+        packed = encode_spatial_packed(header, tick, viewer_small_id=1)
+        full = unpack_spatial(packed)
+        for name in SPATIAL_CHANNELS:
+            np.testing.assert_array_equal(
+                spatial_channel(packed, name), spatial_channel(full, name)
+            )
